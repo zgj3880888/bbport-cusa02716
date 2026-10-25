@@ -765,10 +765,17 @@ index 0000000..4396b68
 +
 +} // namespace Libraries::Zlib
 diff --git a/gpu/shim/bbgpu.cpp b/gpu/shim/bbgpu.cpp
-index fecf55b..c247abe 100644
 --- a/gpu/shim/bbgpu.cpp
 +++ b/gpu/shim/bbgpu.cpp
-@@ -68,6 +68,8 @@ namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver*
+@@ -21,6 +21,7 @@
+ #include "common/polyfill_thread.h"
+ #include "video_core/renderdoc.h"
+ #include <cstring>
++#include <cstdio>
+ #include <mutex>
+ #include <string>
+ #include <chrono>
+@@ -68,6 +69,8 @@
  namespace Libraries::AvPlayer { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
  namespace Libraries::VideoOut { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
  namespace Libraries::Kernel { void RegisterEventQueue(Core::Loader::SymbolsResolver* sym); }
@@ -777,7 +784,7 @@ index fecf55b..c247abe 100644
  
  namespace {
  struct Symbol {
-@@ -325,6 +327,8 @@ extern "C" void bbgpu_register_kernel(void) {
+@@ -325,6 +328,8 @@
      Libraries::Kernel::StartKernelService();
      Core::Loader::SymbolsResolver resolver;
      Libraries::Kernel::RegisterEventQueue(&resolver);
@@ -786,6 +793,28 @@ index fecf55b..c247abe 100644
      Libraries::AvPlayer::RegisterLib(&resolver);
  }
  
+@@ -355,6 +360,21 @@
+ extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
+     BbGnmHooks::PatchImage(image, size);
+     BbGameMenu::PatchImage(image, size);
++    // bbport: the frame rate, display and guest guard hooks are offsets into Bloodborne's own code: the
++    // highest instruction they read or write is 0x2315d79, the constants those instructions load reach
++    // 0x4929e74 (76.8 MB in). They check every site's bytes before writing (a mismatch leaves the game's
++    // code alone), but they check them by reading, and bb-probe allocates exactly `size` bytes: a game
++    // whose image is smaller than those offsets has nothing there and the read faults. CUSA02716's image
++    // is 14.8 MB, and the first of the three (BbFrameRate::PatchImage) died with signal 11 at load,
++    // before a frame was drawn. Bloodborne's own image is 91 MB, so the size alone keeps the layers off
++    // for every other game.
++    constexpr uint64_t BloodborneCodeEnd = 0x2320000; // above the highest site (0x2315d71 + 9)
++    if (size < BloodborneCodeEnd) {
++        std::printf("Patching: the image is %.1f MB, smaller than the code these hooks patch (Bloodborne's "
++                    "reaches %.1f MB): the frame rate, display and guest guard hooks are off\n",
++                    double(size) / 1048576.0, double(BloodborneCodeEnd) / 1048576.0);
++        return;
++    }
+     BbFrameRate::PatchImage(image, size);
+     BbDisplay::PatchImage(image, size);
+     BbGuestGuards::PatchImage(image, size);
 diff --git a/scripts/game_check.py b/scripts/game_check.py
 index 0de63f0..a46d5b1 100644
 --- a/scripts/game_check.py
