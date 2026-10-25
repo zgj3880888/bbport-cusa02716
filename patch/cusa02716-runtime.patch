@@ -842,7 +842,7 @@ index 0de63f0..a46d5b1 100644
          image_hash = image_hash or image_sha256(game)
          if image_hash == SUPPORTED_IMAGE:
 diff --git a/src/runtime.c b/src/runtime.c
-index d0fae6f..37b4766 100644
+index d0fae6f..7603068 100644
 --- a/src/runtime.c
 +++ b/src/runtime.c
 @@ -9,6 +9,7 @@
@@ -853,17 +853,18 @@ index d0fae6f..37b4766 100644
  
  typedef struct {
      union { GuestCallback plain; void (ABI *with_arg)(void *); } callback;
-@@ -96,6 +97,9 @@
+@@ -96,6 +97,10 @@
      runtime_memory_report();
      runtime_ajm_report();
      runtime_audio_report();
 +    runtime_dialogs_report();
 +    runtime_ngs2_report();
 +    runtime_platform_report();
++    runtime_netnp_report();
      runtime_pad_report();
      runtime_savedata_report();
      runtime_file_report();
-@@ -199,6 +203,46 @@
+@@ -199,6 +204,46 @@
      atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcmp(a, b, size);
  }
  static ABI size_t guest_strlen(const char *text) { return strlen(text); }
@@ -910,14 +911,18 @@ index d0fae6f..37b4766 100644
  static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
      printf("Runtime: guest requested exit(%d)\n", status);
      runtime_finalize(NULL);
-@@ -209,29 +253,33 @@
+@@ -209,29 +254,37 @@
      if (!(capabilities & 1)) return 0;
      if (is_data) {
          static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
 -        if (!strcmp(name, "f7uOxY9mM1U#p#J")) return (uintptr_t)&stack_canary;
 -        if (!strcmp(name, "ZT4ODD2Ts9o#libSceLibcInternal")) return (uintptr_t)&need_libc_internal;
++        /* __progname (libkernel): libc prints it in front of its own error messages. It is a
++         * variable, so the import wants its address, not a function's. */
++        static const char *guest_progname = "eboot.bin";
 +        if (runtime_key_match(name, "f7uOxY9mM1U#p#J")) return (uintptr_t)&stack_canary;
 +        if (runtime_key_match(name, "ZT4ODD2Ts9o#libSceLibcInternal")) return (uintptr_t)&need_libc_internal;
++        if (runtime_key_match(name, "djxxOmW6-aw#")) return (uintptr_t)&guest_progname;
          return 0;
      }
      /* Exact scoped imports for CUSA03173; the suffix identifies library/module. */
@@ -963,7 +968,7 @@ index d0fae6f..37b4766 100644
      uintptr_t mutex = runtime_mutex_resolve(name);
      if (mutex) return mutex;
      uintptr_t thread = runtime_thread_resolve(name);
-@@ -254,6 +302,12 @@
+@@ -254,6 +307,14 @@
      if (ajm) return ajm;
      uintptr_t audio = runtime_audio_resolve(name);
      if (audio) return audio;
@@ -973,10 +978,12 @@ index d0fae6f..37b4766 100644
 +    if (ngs2) return ngs2;
 +    uintptr_t platform = runtime_platform_resolve(name);
 +    if (platform) return platform;
++    uintptr_t netnp = runtime_netnp_resolve(name);
++    if (netnp) return netnp;
      uintptr_t pad = runtime_pad_resolve(name);
      if (pad) return pad;
      uintptr_t rtc = runtime_rtc_resolve(name);
-@@ -267,10 +321,32 @@
+@@ -267,10 +328,32 @@
  static const struct { const char *nid, *symbol; } import_names[]={
  #include "import_names.inc"
  };
@@ -1011,7 +1018,7 @@ index d0fae6f..37b4766 100644
  }
  /* Same symbol name means same contract whether imported from libkernel or
 diff --git a/src/runtime.h b/src/runtime.h
-index b0a3b16..e0adac9 100644
+index b0a3b16..9a51ffe 100644
 --- a/src/runtime.h
 +++ b/src/runtime.h
 @@ -178,6 +178,7 @@
@@ -1022,7 +1029,7 @@ index b0a3b16..e0adac9 100644
  uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *nid);
  uintptr_t runtime_kernel_resolve(const char *name);
  uintptr_t runtime_file_resolve(const char *name);
-@@ -227,6 +228,12 @@
+@@ -227,6 +228,16 @@
  void runtime_ajm_report(void);
  uintptr_t runtime_audio_resolve(const char *name);
  void runtime_audio_report(void);
@@ -1032,6 +1039,10 @@ index b0a3b16..e0adac9 100644
 +void runtime_ngs2_report(void);
 +uintptr_t runtime_platform_resolve(const char *name);
 +void runtime_platform_report(void);
++/* The network, PSN, USB storage and libc-internal imports whose NIDs import_names.inc does not
++ * name, so runtime_services.c's name-based tables cannot reach them (src/runtime_netnp.c). */
++uintptr_t runtime_netnp_resolve(const char *name);
++void runtime_netnp_report(void);
  uintptr_t runtime_pad_resolve(const char *name);
  void runtime_pad_report(void);
  uintptr_t runtime_rtc_resolve(const char *name);
@@ -3129,4 +3140,413 @@ index 0000000..ea60353
 +           " keyboard open=%d\n",
 +           error_state, message_state, save_data_state, signin_state, invitation_state,
 +           keyboard_open);
++}
+diff --git a/src/runtime_netnp.c b/src/runtime_netnp.c
+new file mode 100644
+index 0000000..ae19f7d
+--- /dev/null
++++ b/src/runtime_netnp.c
+@@ -0,0 +1,403 @@
++/* The network and PSN imports CUSA02716 makes that runtime_services.c cannot answer.
++ *
++ * runtime_services.c holds the offline contracts - cable unplugged, one local user who is logged in
++ * but signed out of PSN - and answers them by symbol name through runtime_symbol(). 169 of this
++ * title's 763 imports never reach those contracts: import_names.inc was generated from another
++ * title, has no entry for their NIDs, and runtime_symbol() then returns NULL, which no name-based
++ * table can match. This file binds them by NID instead (runtime_key_match compares the eleven NID
++ * characters only) and answers them with the same offline contract:
++ *
++ *   - sceNetCtlInit / sceNetCtlTerm succeed and sceNetCtlGetResult reports no error, which is what
++ *     the library answers with no cable plugged in; nothing is ever connected.
++ *   - Requests, contexts and handles are still handed out (an id from this file's own counter), so
++ *     a setup path runs to the end before the first call that needs PSN refuses it.
++ *   - Everything that needs PSN answers SCE_NP_ERROR_SIGNED_OUT (0x80550006), and *PollAsync
++ *     completes at once with that code, so the game's "PSN is unavailable" path runs rather than a
++ *     wait for a result that would never come.
++ *   - USB mass storage: no device is attached, so the device list is empty, IsExist answers 0 and
++ *     a map request answers ENOENT.
++ *   - sceHttpUriEscape is arithmetic, not a transfer, so it works exactly as the PS4's does.
++ *
++ * Sixty-two of these imports are libSceNpToolkit and five are libSceNpToolkitUtils - the game's own
++ * NP wrapper, whose thread the log names 'Toolkit::NP'. No symbol list names them (they are not in
++ * import_names.inc, and the upstream tree has no such library), so they get the library's own
++ * offline answer, SCE_NP_ERROR_SIGNED_OUT. Eight imports of two dialog libraries are deliberately
++ * left unbound: a dialog's UpdateStatus that answers NONE instead of FINISHED would leave a caller
++ * waiting for a dialog that can never finish, and probe.c's clean stop for an import it cannot
++ * resolve is the better outcome. Neither library is touched at start-up - they are the USB storage
++ * dialog and the friend list dialog, both opened by the player from a menu.
++ *
++ * The counts are for the import list probe.c printed for the image built from this title: 169
++ * imports without an implementation, of which this file binds 160. */
++#define _GNU_SOURCE
++#include "runtime.h"
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++/* PS4 error codes (np_error.h, net_ctl_codes.h, http_error.h, usbd/usbstorage.cpp). */
++#define NP_SIGNED_OUT ((int32_t)0x80550006)
++#define NP_INVALID_ARGUMENT ((int32_t)0x80550003)
++#define NET_CTL_INVALID_ADDR ((int32_t)0x80412107)
++#define HTTP_INVALID_VALUE ((int32_t)0x804311fe)
++#define HTTP_OUT_OF_MEMORY ((int32_t)0x80431022)
++#define USB_STORAGE_INVAL ((int32_t)0x80f40002)
++#define USB_STORAGE_NOENT ((int32_t)0x80f40004)
++/* CommonDialog::Status (system/commondialog.h). */
++#define DIALOG_FINISHED 3
++
++static pthread_mutex_t netnp_lock = PTHREAD_MUTEX_INITIALIZER;
++static int netnp_next_id = 1;
++
++/* ---- The contracts ---- */
++
++/* An entry point with no out-parameter that only has to be accepted: Terminate, Delete, Abort,
++ * Unregister, Destroy, and the Initialize calls that must succeed for setup to go on. */
++static ABI int32_t np_ok(void) { return 0; }
++
++/* Everything that needs PSN. The console is signed out, so this is the answer the library gives. */
++static ABI int32_t np_signed_out(void) { return NP_SIGNED_OUT; }
++
++/* A context, request or handle id: 1, 2, 3 ... The ids are only ever echoed back to this file's
++ * own entry points, which accept any of them, so they identify nothing beyond the log. */
++static ABI int32_t np_new_id(void) {
++    pthread_mutex_lock(&netnp_lock);
++    int id = netnp_next_id++;
++    pthread_mutex_unlock(&netnp_lock);
++    return id;
++}
++
++/* *PollAsync: the operation has finished and it failed. Returning "still in flight" here would
++ * leave the caller polling forever. */
++static ABI int32_t np_poll(int32_t request, int32_t *result) {
++    (void)request;
++    if (!result) return NP_INVALID_ARGUMENT;
++    *result = NP_SIGNED_OUT;
++    return 0;
++}
++
++/* A dialog's UpdateStatus: as in runtime_dialogs.c, the dialog has already finished. */
++static ABI int32_t np_dialog_finished(void) { return DIALOG_FINISHED; }
++
++/* OrbisNpCommerceDialogResult: 0x30 bytes (np/np_commerce/np_commerce.h), zeroed, which reads as
++ * result = ORBIS_COMMON_DIALOG_RESULT_OK and authorized = false - the answer for a store dialog
++ * nobody opened. */
++static ABI int32_t np_commerce_result(void *result) {
++    if (!result) return NP_INVALID_ARGUMENT;
++    memset(result, 0, 0x30);
++    return 0;
++}
++
++/* sceNetCtlGetResult(int eventType, int *errorCode): no connection attempt has been made, so the
++ * last result is "no error". */
++static ABI int32_t netctl_get_result(int32_t event, int32_t *error_code) {
++    (void)event;
++    if (!error_code) return NET_CTL_INVALID_ADDR;
++    *error_code = 0;
++    return 0;
++}
++
++/* sceHttpUriEscape(char *out, u64 *require, u64 prepare, const char *in): percent-encodes every
++ * byte that is not RFC 3986 unreserved. Pure arithmetic, so it does the real work: out == NULL
++ * (or a short buffer) is the size query the game makes before it allocates. */
++static ABI int32_t http_uri_escape(char *out, uint64_t *require, uint64_t prepare, const char *in) {
++    static const char hex[] = "0123456789ABCDEF";
++    if (!in) return HTTP_INVALID_VALUE;
++    uint64_t needed = 1; /* the terminator */
++    for (const char *s = in; *s; ++s) {
++        unsigned char c = (unsigned char)*s;
++        const int unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
++                               (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
++        needed += unreserved ? 1 : 3;
++    }
++    if (require) *require = needed;
++    if (!out) return 0;
++    if (prepare < needed) return HTTP_OUT_OF_MEMORY;
++    char *dst = out;
++    for (const char *s = in; *s; ++s) {
++        unsigned char c = (unsigned char)*s;
++        const int unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
++                               (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
++        if (unreserved) *dst++ = (char)c;
++        else { *dst++ = '%'; *dst++ = hex[(c >> 4) & 0xF]; *dst++ = hex[c & 0xF]; }
++    }
++    *dst = 0;
++    return 0;
++}
++
++/* ---- USB mass storage: no device is attached ---- */
++static ABI int32_t usb_unmap(uint32_t device, const char *directory) {
++    (void)device;
++    if (!directory) return USB_STORAGE_INVAL;
++    return 0;
++}
++static ABI int32_t usb_device_list(uint32_t *ids, uint32_t *count) {
++    if (!ids || !count) return USB_STORAGE_INVAL;
++    *count = 0;
++    return 0;
++}
++/* GetDeviceInfo and RequestMap: the device the caller names is not there. */
++static ABI int32_t usb_no_device(uint32_t device, void *info) {
++    (void)device;
++    if (!info) return USB_STORAGE_INVAL;
++    return USB_STORAGE_NOENT;
++}
++static ABI int32_t usb_is_exist(uint32_t device) { (void)device; return 0; }
++
++/* ---- libkernel / libc internals the guest's libc asks for ---- */
++/* __elf_phdr_match_addr(const void *info, void *address): the dl_iterate_phdr helper. Nothing
++ * enumerates phdrs here, so nothing matches. */
++static ABI int32_t k_phdr_match(const void *info, void *address) { (void)info; (void)address; return 0; }
++/* __pthread_cxa_finalize(void *dso): runs a DSO's destructors. There are none to run. */
++static ABI void k_cxa_finalize(void *dso) { (void)dso; }
++/* _is_signal_return: no frame of ours is a signal return frame. */
++static ABI int32_t k_is_signal_return(uintptr_t address) { (void)address; return 0; }
++/* sigreturn(const ucontext_t *): it cannot succeed from the guest, so it reports the failure the
++ * way the syscall does instead of pretending to have restored a context. */
++static ABI int32_t k_sigreturn(const void *context) { (void)context; return -1; }
++
++/* ---- Binding ---- */
++
++/* Every import this file answered, counted by group, for the report. Resolve runs once per import
++ * while the image is being relocated, so the counts describe what the image asked for. */
++enum { G_NETCTL, G_HTTP, G_NP, G_USB, G_AUDIODEC, G_KERNEL, G_GROUPS };
++static size_t netnp_binds[G_GROUPS];
++static const char *const netnp_group_names[G_GROUPS] = {
++    "netctl", "http", "np", "usb storage", "audiodec", "libkernel"};
++
++#define BIND(group, handler)                                                   \
++    do {                                                                       \
++        netnp_binds[group]++;                                                  \
++        return (uintptr_t)(handler);                                           \
++    } while (0)
++
++uintptr_t runtime_netnp_resolve(const char *name) {
++
++    /* ---- libSceAudiodec (5) ---- */
++    if (runtime_key_match(name, "VjhsmxpcezI#")) BIND(G_AUDIODEC, np_ok); /* unnamed */
++    if (runtime_key_match(name, "h5jSB2QIDV0#")) BIND(G_AUDIODEC, np_ok); /* unnamed */
++    if (runtime_key_match(name, "Tp+ZEy69mLk#")) BIND(G_AUDIODEC, np_ok); /* unnamed */
++    if (runtime_key_match(name, "KHXHMDLkILw#")) BIND(G_AUDIODEC, np_ok); /* unnamed */
++    if (runtime_key_match(name, "O3f1sLMWRvs#")) BIND(G_AUDIODEC, np_ok); /* unnamed */
++
++    /* ---- libSceHttp (1) ---- */
++    if (runtime_key_match(name, "YuOW3dDAKYc#")) BIND(G_HTTP, http_uri_escape); /* sceHttpUriEscape */
++
++    /* ---- libSceNetCtl (3) ---- */
++    if (runtime_key_match(name, "0cBgduPRR+M#")) BIND(G_NETCTL, netctl_get_result); /* sceNetCtlGetResult */
++    if (runtime_key_match(name, "gky0+oaNM4k#")) BIND(G_NETCTL, np_ok); /* sceNetCtlInit */
++    if (runtime_key_match(name, "Z4wwCFiBELQ#")) BIND(G_NETCTL, np_ok); /* sceNetCtlTerm */
++
++    /* ---- libSceNpAuth (1) ---- */
++    if (runtime_key_match(name, "6bwFkosYRQg#")) BIND(G_NP, np_new_id); /* sceNpAuthCreateRequest */
++
++    /* ---- libSceNpCommerce (1) ---- */
++    if (runtime_key_match(name, "r42bWcQbtZY#")) BIND(G_NP, np_commerce_result); /* sceNpCommerceDialogGetResult */
++
++
++    /* ---- libSceNpFriendListDialog (3): left unbound on purpose ----
++     * OoTjfxl8-wI, VtyS8XLBqNE, pTvAKV1iQkE. None of the three is named by a symbol list, and a
++     * dialog library's UpdateStatus is among them: answering NONE instead of FINISHED would leave a
++     * caller waiting for a dialog that can never finish. Not bound, so probe.c stops the game and
++     * names the import instead of hanging. The friend list is opened from a menu, not at start-up. */
++
++    /* ---- libSceNpManager (7) ---- */
++    if (runtime_key_match(name, "GpLQDNKICac#")) BIND(G_NP, np_new_id); /* sceNpCreateRequest */
++    if (runtime_key_match(name, "GFhVUpRmbHE#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "bMG3cVmUmuk#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "+anuSx2avHQ#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "s4UEa5iBJdc#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "Vh1bhUG6mSs#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "ON7Sf5XEMmI#")) BIND(G_NP, np_signed_out); /* unnamed */
++
++    /* ---- libSceNpMatching2 (9) ---- */
++    if (runtime_key_match(name, "meEjIdbjAA0#")) BIND(G_NP, np_signed_out); /* sceNpMatching2SetUserInfo */
++    if (runtime_key_match(name, "uBESzz4CQws#")) BIND(G_NP, np_ok); /* sceNpMatching2RegisterRoomMessageCallback */
++    if (runtime_key_match(name, "qeF-q5KDtAc#")) BIND(G_NP, np_signed_out); /* sceNpMatching2GetUserInfoList */
++    if (runtime_key_match(name, "Iw2h0Jrrb5U#")) BIND(G_NP, np_signed_out); /* sceNpMatching2SendRoomMessage */
++    if (runtime_key_match(name, "26vWrPAWJfM#")) BIND(G_NP, np_signed_out); /* sceNpMatching2GetRoomDataExternalList */
++    if (runtime_key_match(name, "Jraxifmoet4#")) BIND(G_NP, np_signed_out); /* sceNpMatching2GetRoomDataInternal */
++    if (runtime_key_match(name, "5lhvOqheFBA#")) BIND(G_NP, np_signed_out); /* sceNpMatching2GetRoomMemberDataInternal */
++    if (runtime_key_match(name, "opDpl74pi2E#")) BIND(G_NP, np_ok); /* sceNpMatching2SendRoomChatMessage */
++    if (runtime_key_match(name, "twVupeaYYrk#")) BIND(G_NP, np_signed_out); /* sceNpMatching2SignalingGetConnectionInfo */
++
++    /* ---- libSceNpScore (9) ---- */
++    if (runtime_key_match(name, "ANJssPz3mY0#")) BIND(G_NP, np_signed_out); /* sceNpScoreRecordScoreAsync */
++    if (runtime_key_match(name, "9mZEgoiEq6Y#")) BIND(G_NP, np_signed_out); /* sceNpScoreGetRankingByNpId */
++    if (runtime_key_match(name, "Rd27dqUFZV8#")) BIND(G_NP, np_signed_out); /* sceNpScoreGetRankingByNpIdAsync */
++    if (runtime_key_match(name, "rShmqXHwoQE#")) BIND(G_NP, np_signed_out); /* sceNpScoreGetRankingByRangeAsync */
++    if (runtime_key_match(name, "8kuIzUw6utQ#")) BIND(G_NP, np_signed_out); /* sceNpScoreGetFriendsRanking */
++    if (runtime_key_match(name, "7SuMUlN7Q6I#")) BIND(G_NP, np_signed_out); /* sceNpScoreGetFriendsRankingAsync */
++    if (runtime_key_match(name, "1gL5PwYzrrw#")) BIND(G_NP, np_signed_out); /* sceNpScoreRecordGameDataAsync */
++    if (runtime_key_match(name, "JjOFRVPdQWc#")) BIND(G_NP, np_signed_out); /* sceNpScoreGetGameDataAsync */
++    if (runtime_key_match(name, "m1DfNRstkSQ#")) BIND(G_NP, np_poll); /* sceNpScorePollAsync */
++
++    /* ---- libSceNpSnsFacebookDialog (5) ---- */
++    if (runtime_key_match(name, "tdQArULbNQk#")) BIND(G_NP, np_ok); /* unnamed */
++    if (runtime_key_match(name, "Hi3onqHSN6M#")) BIND(G_NP, np_ok); /* unnamed */
++    if (runtime_key_match(name, "fjV7C8H0Y8k#")) BIND(G_NP, np_dialog_finished); /* sceNpSnsFacebookDialogUpdateStatus */
++    if (runtime_key_match(name, "AifdcI1aKas#")) BIND(G_NP, np_ok); /* unnamed */
++    if (runtime_key_match(name, "cdqOFyupRS4#")) BIND(G_NP, np_ok); /* unnamed */
++
++    /* ---- libSceNpToolkit (62) ---- */
++    if (runtime_key_match(name, "FIjXN2TkuTs#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "qBMjqyBn3OM#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "qSmqLXXCPas#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "SHtAad20YYM#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "IlsmvBtMkak#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "xhAcaIwnrgk#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "ivMCitpSQNk#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "+isUKw4zud4#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "hoINmSMlYjI#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "EnesV4gXDtE#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "cn9svYGWKDQ#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "4zrm6VrgIAw#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "L1KAkYWml-M#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "DIxvoy7Ngvk#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "epJ6x2LV0kU#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "DlWmn2ZQuWY#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "WTtYf+cNnXI#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "cG1VE2HMl6c#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "-hJRce8wn1U#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "cK6bYHf-Q5E#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "Cxwy7wHq4J0#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "PR5k1penBLM#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "RujUxbr3haM#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "OcAgPxcq5Vk#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "S5JxQnoGF3E#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "bcH5EnFE2xY#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "WXF2ihRF+B8#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "5AZPp99ogrc#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "iAIYn4oAWvI#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "Yfw63FVJgtU#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "w5+VCznos5E#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "9yLjn46Ypfs#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "XlWbvieLj2M#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "HwDt5lD9Bfo#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "ONT8As5R1ug#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "rQGJeNjOuUk#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "VbFjEs--uiA#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "0CAesfH963Q#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "aVDQZGAqOo8#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "UVBkipSD2sw#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "wcgr5mte7T8#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "OJPTonqdg0I#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "urOpESTBZmo#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "a2Zv3idT0sU#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "w7nqTT3zgxU#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "sn4HNCtNRzY#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "zTwZdI8AZ5Y#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "5JmzZt8twAo#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "EUH+EmT-v9E#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "fSb2oQTNrgA#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "3xUXnmUkXfo#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "bI5AGFMydrA#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "HJ8GpRT1aiw#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "a+W7HHlwpBs#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "9KUZFjI1IxA#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "ERuf9y0DY84#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "JP-PtKMiI1E#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "w5UbvPLGye0#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "dIVxrrdpS9M#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "GEylwSsiGG8#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "Ncel8t2Rrpc#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "i-XwZjw0OOY#")) BIND(G_NP, np_signed_out); /* unnamed */
++
++    /* ---- libSceNpToolkitUtils (5) ---- */
++    if (runtime_key_match(name, "xtbb-2f703A#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "5TvttyRuU84#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "HwEtHFCpU5U#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "PkdLsRA4ON0#")) BIND(G_NP, np_signed_out); /* unnamed */
++    if (runtime_key_match(name, "sJptZwvs1is#")) BIND(G_NP, np_signed_out); /* unnamed */
++
++    /* ---- libSceNpTrophy (6) ---- */
++    if (runtime_key_match(name, "eBL+l6HG9xk#")) BIND(G_NP, np_signed_out); /* sceNpTrophyGetTrophyIcon */
++    if (runtime_key_match(name, "w4uMPmErD4I#")) BIND(G_NP, np_signed_out); /* sceNpTrophyGetGroupIcon */
++    if (runtime_key_match(name, "HLwz1fRIycA#")) BIND(G_NP, np_signed_out); /* sceNpTrophyGetGameIcon */
++    if (runtime_key_match(name, "GNcF4oidY0Y#")) BIND(G_NP, np_ok); /* sceNpTrophyDestroyHandle */
++    if (runtime_key_match(name, "E1Wrwd07Lr8#")) BIND(G_NP, np_ok); /* sceNpTrophyDestroyContext */
++    if (runtime_key_match(name, "wTUwGfspKic#")) BIND(G_NP, np_signed_out); /* sceNpTrophyGetGroupInfo */
++
++    /* ---- libSceNpTus (17) ---- */
++    if (runtime_key_match(name, "BIkMmUfNKWM#")) BIND(G_NP, np_new_id); /* sceNpTusCreateNpTitleCtx */
++    if (runtime_key_match(name, "3bh2aBvvmvM#")) BIND(G_NP, np_new_id); /* sceNpTusCreateRequest */
++    if (runtime_key_match(name, "-SUR+UoLS6c#")) BIND(G_NP, np_signed_out); /* sceNpTssGetData */
++    if (runtime_key_match(name, "CcIH40dYS88#")) BIND(G_NP, np_ok); /* sceNpTusDeleteRequest */
++    if (runtime_key_match(name, "H3uq7x0sZOI#")) BIND(G_NP, np_ok); /* sceNpTusDeleteNpTitleCtx */
++    if (runtime_key_match(name, "1Cz0hTJFyh4#")) BIND(G_NP, np_signed_out); /* sceNpTusSetMultiSlotVariableVUser */
++    if (runtime_key_match(name, "c6aYoa47YgI#")) BIND(G_NP, np_signed_out); /* sceNpTusSetMultiSlotVariable */
++    if (runtime_key_match(name, "uFxVYJEkcmc#")) BIND(G_NP, np_signed_out); /* sceNpTusGetMultiSlotVariableVUser */
++    if (runtime_key_match(name, "F+eQlfcka98#")) BIND(G_NP, np_signed_out); /* sceNpTusGetMultiSlotVariable */
++    if (runtime_key_match(name, "ukr6FBSrkJw#")) BIND(G_NP, np_signed_out); /* sceNpTusAddAndGetVariableVUser */
++    if (runtime_key_match(name, "cRVmNrJDbG8#")) BIND(G_NP, np_signed_out); /* sceNpTusAddAndGetVariable */
++    if (runtime_key_match(name, "+RhzSuuXwxo#")) BIND(G_NP, np_signed_out); /* sceNpTusSetDataVUser */
++    if (runtime_key_match(name, "4NrufkNCkiE#")) BIND(G_NP, np_signed_out); /* sceNpTusSetData */
++    if (runtime_key_match(name, "GQHCksS7aLs#")) BIND(G_NP, np_signed_out); /* sceNpTusGetDataVUser */
++    if (runtime_key_match(name, "XOzszO4ONWU#")) BIND(G_NP, np_signed_out); /* sceNpTusGetData */
++    if (runtime_key_match(name, "xutwCvsydkk#")) BIND(G_NP, np_signed_out); /* sceNpTusDeleteMultiSlotDataVUser */
++    if (runtime_key_match(name, "0DT5bP6YzBo#")) BIND(G_NP, np_signed_out); /* sceNpTusDeleteMultiSlotData */
++
++    /* ---- libSceNpUtility (13) ---- */
++    if (runtime_key_match(name, "iQr9UxPHUFs#")) BIND(G_NP, np_new_id); /* sceNpLookupCreateRequest */
++    if (runtime_key_match(name, "jktww3yJXnc#")) BIND(G_NP, np_ok); /* sceNpBandwidthTestInitStart */
++    if (runtime_key_match(name, "BYIZGKm6bO4#")) BIND(G_NP, np_ok); /* sceNpBandwidthTestGetStatus */
++    if (runtime_key_match(name, "pLr1fEQS1z8#")) BIND(G_NP, np_ok); /* sceNpBandwidthTestShutdown */
++    if (runtime_key_match(name, "t0P5z5yuFPA#")) BIND(G_NP, np_ok); /* sceNpWordFilterDeleteTitleCtx */
++    if (runtime_key_match(name, "r9BgI0PfJZg#")) BIND(G_NP, np_new_id); /* sceNpWordFilterCreateTitleCtx */
++    if (runtime_key_match(name, "1dMndqL-QgE#")) BIND(G_NP, np_signed_out); /* sceNpWordFilterCensorComment */
++    if (runtime_key_match(name, "Jj4mkpFO2gE#")) BIND(G_NP, np_signed_out); /* sceNpWordFilterSanitizeComment */
++    if (runtime_key_match(name, "iCq5xW5KQW4#")) BIND(G_NP, np_new_id); /* sceNpWordFilterCreateRequest */
++    if (runtime_key_match(name, "IEB+vgVoQbw#")) BIND(G_NP, np_new_id); /* sceNpWordFilterCreateAsyncRequest */
++    if (runtime_key_match(name, "PYFS1H70bDs#")) BIND(G_NP, np_ok); /* sceNpWordFilterDeleteRequest */
++    if (runtime_key_match(name, "rAOOqDAxBIk#")) BIND(G_NP, np_ok); /* sceNpWordFilterAbortRequest */
++    if (runtime_key_match(name, "ur5SShyG0dk#")) BIND(G_NP, np_poll); /* sceNpWordFilterPollAsync */
++
++    /* ---- libSceNpWebApi (3) ---- */
++    if (runtime_key_match(name, "79M-JqvvGo0#")) BIND(G_NP, np_new_id); /* sceNpWebApiCreateHandle */
++    if (runtime_key_match(name, "5Mn7TYwpl30#")) BIND(G_NP, np_ok); /* sceNpWebApiDeleteHandle */
++    if (runtime_key_match(name, "KjNeZ-29ysQ#")) BIND(G_NP, np_signed_out); /* sceNpWebApiSendRequest2 */
++
++    /* ---- libSceNpWebApiCompat (4) ---- */
++    if (runtime_key_match(name, "sIFx734+xys#")) BIND(G_NP, np_signed_out); /* sceNpWebApiCreateServicePushEventFilter */
++    if (runtime_key_match(name, "PfQ+f6ws764#")) BIND(G_NP, np_ok); /* sceNpWebApiDeleteServicePushEventFilter */
++    if (runtime_key_match(name, "kJQJE0uKm5w#")) BIND(G_NP, np_signed_out); /* sceNpWebApiRegisterServicePushEventCallback */
++    if (runtime_key_match(name, "2edrkr0c-wg#")) BIND(G_NP, np_ok); /* sceNpWebApiUnregisterServicePushEventCallback */
++
++    /* ---- libSceUsbStorage (5) ---- */
++    if (runtime_key_match(name, "fl3roYs7F9U#")) BIND(G_USB, usb_unmap); /* sceUsbStorageRequestUnmap */
++    if (runtime_key_match(name, "mryrNITeYvI#")) BIND(G_USB, usb_device_list); /* sceUsbStorageGetDeviceList */
++    if (runtime_key_match(name, "-GvBqz54ssU#")) BIND(G_USB, usb_no_device); /* sceUsbStorageGetDeviceInfo */
++    if (runtime_key_match(name, "tO8DvyElInw#")) BIND(G_USB, usb_is_exist); /* sceUsbStorageIsExist */
++    if (runtime_key_match(name, "IDYJZSeBgDs#")) BIND(G_USB, usb_no_device); /* sceUsbStorageRequestMap */
++
++
++    /* ---- libSceUsbStorageDialog (5): left unbound on purpose ----
++     * O2rgVi8YyOg, IX49aL2rOGU, ClBMa8CWKkM, MpXK+QLRpwU, ul-kdmwPExY. The dialog of a device that
++     * is never attached; as with the friend list, binding its UpdateStatus to the wrong value is
++     * worse than leaving it for probe.c to report. */
++
++    /* ---- libkernel (5) ---- */
++    if (runtime_key_match(name, "Fjc4-n1+y2g#")) BIND(G_KERNEL, k_phdr_match); /* __elf_phdr_match_addr */
++    if (runtime_key_match(name, "kbw4UHHSYy0#")) BIND(G_KERNEL, k_cxa_finalize); /* __pthread_cxa_finalize */
++    if (runtime_key_match(name, "crb5j7mkk1c#")) BIND(G_KERNEL, k_is_signal_return); /* _is_signal_return */
++    if (runtime_key_match(name, "mo0bFmWppIw#")) BIND(G_KERNEL, k_sigreturn); /* sigreturn */
++    return 0;
++}
++
++void runtime_netnp_report(void) {
++    size_t total = 0;
++    for (int i = 0; i < G_GROUPS; ++i) total += netnp_binds[i];
++    if (!total) {
++        printf("Runtime: netnp: no import bound\n");
++        return;
++    }
++    printf("Runtime: netnp: %zu imports bound (", total);
++    int first = 1;
++    for (int i = 0; i < G_GROUPS; ++i) {
++        if (!netnp_binds[i]) continue;
++        printf("%s%s %zu", first ? "" : ", ", netnp_group_names[i], netnp_binds[i]);
++        first = 0;
++    }
++    printf(")\n");
 +}
