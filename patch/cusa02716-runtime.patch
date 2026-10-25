@@ -1,21 +1,8 @@
 diff --git a/gpu/CMakeLists.txt b/gpu/CMakeLists.txt
-index 012ee43..8362bc0 100644
+index 012ee43..5bdc3a6 100644
 --- a/gpu/CMakeLists.txt
 +++ b/gpu/CMakeLists.txt
-@@ -11,6 +11,12 @@ endif()
- # Frame pointers keep the loader's thread dumps (watchdog, SIGUSR2 sampling) walkable.
- add_compile_options(-fno-omit-frame-pointer)
- 
-+# bbport: Boost 1.83's asio (execution/detail/as_receiver.hpp, as_invocable.hpp) uses
-+# std::terminate and std::make_exception_ptr without pulling in <exception>. GCC happens to
-+# include it transitively; NDK r29's libc++ in C++23 mode does not, so pre-include it for every
-+# C++ translation unit. Guarded by COMPILE_LANGUAGE so the C sources stay untouched.
-+add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-include;exception>")
-+
- # bbport: link-time optimization (BB_LTO, default on) and profile-guided optimization
- # (BB_PGO: off, generate = instrumented build writing into BB_PGO_DIR, use = build with that
- # profile). Covers bbgpu and the static libraries linked into it. No -march: the same build
-@@ -166,7 +172,9 @@ file(GLOB CP_SOURCES CONFIGURE_DEPENDS cp/*.cpp)
+@@ -166,9 +166,18 @@ file(GLOB CP_SOURCES CONFIGURE_DEPENDS cp/*.cpp)
  add_library(bbgpu SHARED ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES} ${LAYER_SOURCES} ${GAME_SOURCES} ${CP_SOURCES}
      shadps4/core/libraries/gnmdriver/gnmdriver.cpp
      shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
@@ -25,7 +12,16 @@ index 012ee43..8362bc0 100644
 +    ${AVPLAYER}
      shadps4/core/libraries/videodec/video_utils.cpp)
  add_dependencies(bbgpu host_shaders)
++# bbport: Boost 1.83's asio (execution/detail/as_receiver.hpp, as_invocable.hpp) uses
++# std::terminate and std::make_exception_ptr without pulling in <exception>. GCC brings it in
++# transitively; NDK r29's libc++ under C++23 does not, so pre-include it here. Deliberately scoped
++# to bbgpu: a global add_compile_options also reaches fsr-vulkan's host-compile rules, which pass
++# -o together with several inputs and then die with "cannot specify -o when generating multiple
++# output files".
++target_compile_options(bbgpu PRIVATE "SHELL:$<$<COMPILE_LANGUAGE:CXX>:-include exception>")
  # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
+ # embedded Cyrillic font (third_party/fonts).
+ target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
 diff --git a/gpu/shadps4/core/libraries/kernel/eventflag.cpp b/gpu/shadps4/core/libraries/kernel/eventflag.cpp
 new file mode 100644
 index 0000000..9323a9d
