@@ -92,8 +92,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             ninja-build cmake pkg-config ripgrep unzip xz-utils \
-            libboost-dev libssl-dev zlib1g-dev
+            libboost-dev libssl-dev zlib1g-dev \
+            glslang-tools spirv-tools libvulkan-dev
           python3 -c "import PIL" 2>/dev/null || pip3 install --break-system-packages Pillow
+          # GLSL/SPIR-V 工具链自检：gpu 的 CMake 配置在 find_program 阶段就会拦下来
+          which glslangValidator glslang spirv-val || true
 
       - name: 构建
         run: bash ci/build.sh "${{ inputs.stage || 'all' }}"
