@@ -90,6 +90,18 @@ step_deps() {
 step_bionic() {
     log "stage: bionic runtime (libbbcpu / libbbgpu / bb-probe / bb-prepare)"
     [[ -f $NDK/build/cmake/android.toolchain.cmake ]] || die "NDK 缺失: $NDK"
+
+    # gpu 里用的是 header-only 的 Boost（定义 BOOST_ASIO_STANDALONE），但 CMake 交叉编译时
+    # 只把 $prefix/include 和 /usr/local/include 放进 include 路径，host 的 /usr/include 进不来，
+    # 于是 boost/asio/*.hpp 找不到。把系统 Boost 头挂到 bionic 前缀下，走已有的 -isystem。
+    local prefix=$PWD/.local-deps/android/bionic-prefix
+    if [[ ! -e $prefix/include/boost ]]; then
+        [[ -d /usr/include/boost ]] || die "系统缺 Boost 头（apt install libboost-dev）"
+        mkdir -p "$prefix/include"
+        ln -sfn /usr/include/boost "$prefix/include/boost"
+        log "Boost headers linked: $prefix/include/boost -> /usr/include/boost"
+    fi
+
     bash tools/android/build_bionic.sh
 }
 
