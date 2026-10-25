@@ -1795,10 +1795,10 @@ index afc385a..0ffd0fe 100644
  BB_RUNTIME_ARCHIVE="$PWD/out/release/runtime.tar.gz" bash tools/android/build_frontend.sh
  cp out/thor/frontend/Bloodborne-Thor.apk "$apk"
 diff --git a/tools/android/build_release_runtime.py b/tools/android/build_release_runtime.py
-index a5f1340..fd23a2f 100644
+index a5f1340..9058284 100644
 --- a/tools/android/build_release_runtime.py
 +++ b/tools/android/build_release_runtime.py
-@@ -82,10 +82,14 @@ def stage_runtime(stage):
+@@ -82,10 +82,32 @@ def stage_runtime(stage):
      extra = sorted(p.name for p in (BIONIC / 'lib').iterdir() if p.name not in LIBRARIES)
      if extra:
          raise SystemExit(f'Unexpected libraries in {BIONIC / "lib"}: {", ".join(extra)} (add them to LIBRARIES if needed)')
@@ -1806,27 +1806,44 @@ index a5f1340..fd23a2f 100644
 -        raise SystemExit(f'The game patches are compiled from the 1.09 eboot: {EBOOT} is missing')
 -    subprocess.run([sys.executable, str(TOOLS / 'build_patch_parts.py'), '--out', str(stage / 'patch-parts'),
 -                    '--eboot', str(EBOOT)], check=True)
-+    # bbport: the patch parts are compiled from the 1.09 eboot, which only the game's owner has.
-+    # A CI build has no game files at all, so package without them instead of refusing to build
-+    # (the settings' BBPATCH2 files are then simply absent from the runtime).
++    # bbport: the patch parts are Bloodborne's, compiled from that game's 1.09 eboot by
++    # build_patch_parts.py (its sites are hard-coded CUSA03173 offsets). A build for another game must
++    # not carry them, and a CI build has no game files at all: package an empty patch-parts/ instead.
++    # RuntimeInstaller.installed() requires the directory to exist, and run-bionic.sh skips whatever is
++    # not in it, so the other game starts on its own resolution and frame rate.
 +    if EBOOT.is_file():
 +        subprocess.run([sys.executable, str(TOOLS / 'build_patch_parts.py'), '--out', str(stage / 'patch-parts'),
 +                        '--eboot', str(EBOOT)], check=True)
 +    else:
-+        print(f'Note: {EBOOT} is missing, packaging without the game patch parts', file=sys.stderr)
++        (stage / 'patch-parts').mkdir(parents=True, exist_ok=True)
++        (stage / 'patch-parts' / 'README.txt').write_text(
++            'This folder holds Bloodborne\'s (CUSA03173 01.09) pre-compiled game patches.\n'
++            '\n'
++            'It is empty on purpose:\n'
++            '\n'
++            '  * build_patch_parts.py compiles them from that game\'s 1.09 eboot (out/eboot.elf); its\n'
++            '    patch sites are hard-coded CUSA03173 offsets, so they apply to no other game. Putting\n'
++            '    them into another title would corrupt its code, not improve it.\n'
++            '  * run-bionic.sh applies only the parts that are present, so a missing part is never\n'
++            '    fatal: the game simply runs at its own resolution and frame rate.\n'
++            '\n'
++            'For a CUSA03173 build, compile them on a machine that has the 1.09 eboot:\n'
++            '  python3 tools/android/build_patch_parts.py --out <this folder> --eboot <eboot.elf>\n',
++            encoding='utf-8')
++        print(f'Note: {EBOOT} is missing, packaging an empty patch-parts (Bloodborne-only patches, '
++              'not used by this title)', file=sys.stderr)
  
  
  def owned_by_root(member):
-@@ -121,7 +125,8 @@ def main():
+@@ -121,6 +143,8 @@ def main():
      archive = OUT / 'runtime.tar.gz'
      with tarfile.open(archive, 'w:gz', compresslevel=6, format=tarfile.PAX_FORMAT) as tar:
          tar.add(stage / 'bionic', arcname='bbport/bionic', filter=owned_by_root)
--        tar.add(stage / 'patch-parts', arcname='bbport/patch-parts', filter=owned_by_root)
-+        if (stage / 'patch-parts').is_dir():
-+            tar.add(stage / 'patch-parts', arcname='bbport/patch-parts', filter=owned_by_root)
++        # Always present (stage_runtime makes it: the compiled parts, or the README saying why they are
++        # missing): the installer's completeness check wants the directory, not the patches in it.
+         tar.add(stage / 'patch-parts', arcname='bbport/patch-parts', filter=owned_by_root)
          for source, name, mode in FILES:
              info = tar.gettarinfo(str(ROOT / source), arcname='bbport/' + name)
-             info.mode = mode
 diff --git a/tools/android/build_turnip_android.sh b/tools/android/build_turnip_android.sh
 index 7a6d457..c5addf3 100755
 --- a/tools/android/build_turnip_android.sh
@@ -1840,6 +1857,24 @@ index 7a6d457..c5addf3 100755
  
  venv=$deps/mesa-venv
  if [[ ! -x $venv/bin/meson ]]; then
+diff --git a/tools/android/frontend/src/ro/cobrabm/fexdroid/AutoDriver.java b/tools/android/frontend/src/ro/cobrabm/fexdroid/AutoDriver.java
+index 6e7ba3b..ee6954e 100644
+--- a/tools/android/frontend/src/ro/cobrabm/fexdroid/AutoDriver.java
++++ b/tools/android/frontend/src/ro/cobrabm/fexdroid/AutoDriver.java
+@@ -45,6 +45,13 @@ final class AutoDriver {
+             String why=spec.label+" needs Android "+androidRelease(spec.minApi)+" or newer (this is API "+sdk+")";
+             return new Result(null,"GPU driver auto: phone's own driver ("+why+")","Using the phone's own GPU driver: "+why+".");
+         }
++        // bbport: a build made with BB_SKIP_DRIVERS=1 carries no assets/drivers, but the spec list is
++        // compile-time: without this check every start would try to install a zip that is not in the
++        // APK and tell the player it failed. The phone's own Vulkan is what such a build runs on.
++        try (InputStream probe=context.getAssets().open(spec.asset())) {
++        } catch (IOException noDriverInApk) {
++            return new Result(null,"GPU driver auto: phone's own driver (this build bundles no GPU driver)",null);
++        }
+         try {
+             DriverManager.Driver have=null;
+             for (DriverManager.Driver d:drivers.list())
 diff --git a/tools/android/prepare_game.py b/tools/android/prepare_game.py
 index 9875a3d..4e7081c 100644
 --- a/tools/android/prepare_game.py
@@ -1880,3 +1915,80 @@ index 9875a3d..4e7081c 100644
          content_profile.prepare(game, work)
          os.replace(work / 'boot-linked.bin', data / 'boot-linked.bin')
          os.replace(work / 'content.bin', data / 'content.bin')
+diff --git a/tools/android/run-bionic.sh b/tools/android/run-bionic.sh
+index 448d0e2..72b1895 100755
+--- a/tools/android/run-bionic.sh
++++ b/tools/android/run-bionic.sh
+@@ -111,6 +111,14 @@ if [ "$render" = 1920x1080 ]; then render=; preset=0; fi
+ dmem_mb=5056; big_scene=0
+ if [ $((scene_w * scene_h)) -gt $((1920 * 1080)) ]; then big_scene=1; dmem_mb=${BB_DMEM_MB_HIGH:-9152}; fi
+ echo "Scene ${render:-1920x1080} for $output at preset $preset$([ "$big_scene" = 1 ] && echo "; larger than 1080p: $dmem_mb MB direct memory")"
++# bbport: the resolution patch (patch-parts/res-scene.bin) is Bloodborne's — build_patch_parts.py compiles
++# it from that game's 1.09 eboot, whose scene-size immediates it rewrites. Another game's image has no
++# such immediates, and BB_RENDER_RES alone would take libbbgpu down the startup-patched-scene path for
++# nothing: render at the game's own size instead (the upscaler still scales that to the surface).
++if [ -n "$render" ] && [ ! -f "$base/patch-parts/res-scene.bin" ]; then
++    echo "No scene size patch in patch-parts: rendering at the game's own size" >&2
++    render=
++fi
+ export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
+ # FSR 3.1 frame generation (frame_generation=1): a frame between each two, with FSR 3.1 only.
+ [ "$(setting frame_generation)" = 1 ] && [ "$upscaler" = fsr3 ] && export BB_FRAME_GEN=1
+@@ -415,27 +423,42 @@ if [ "${1:-game}" = game ]; then
+     app0_dir=${BB_APP0_DIR:-$game_dir}
+     # The settings' pre-compiled patches (build_patch_parts.py) as the words of $patch_args (none of the
+     # paths has a space).
++    # bbport: the parts are compiled from the 1.09 eboot by build_patch_parts.py, which a CI build has no
++    # game files for: it then ships an empty patch-parts/ and the game starts without the settings'
++    # patches (no resolution patch, the game's own 30 FPS). A missing part is never fatal: every one of
++    # them is a byte write bb-probe would refuse as "invalid patch file" anyway.
+     parts="$base/patch-parts"
+-    [ -d "$parts" ] || { echo "The patches are missing: $parts" >&2; exit 2; }
+     patch_args=
+-    if [ -n "$render" ]; then
+-        [ -f "$parts/res-scene.bin" ] || { echo "The scene size patch is missing: $parts/res-scene.bin" >&2; exit 2; }
+-        # The patch holds a 1280x720 scene: libbbgpu writes the real size (BB_RENDER_RES) into it at load.
+-        patch_args="--patches $parts/res-scene.bin"
+-        [ "$big_scene" = 1 ] && [ -f "$parts/graphics-heap.bin" ] && patch_args="$patch_args --patches $parts/graphics-heap.bin"
++    if [ ! -d "$parts" ]; then
++        echo "Note: the patches are missing ($parts): starting without them" >&2
++        parts=
++    fi
++    if [ -n "$parts" ] && [ -n "$render" ]; then
++        if [ -f "$parts/res-scene.bin" ]; then
++            # The patch holds a 1280x720 scene: libbbgpu writes the real size (BB_RENDER_RES) into it at load.
++            patch_args="--patches $parts/res-scene.bin"
++            [ "$big_scene" = 1 ] && [ -f "$parts/graphics-heap.bin" ] && patch_args="$patch_args --patches $parts/graphics-heap.bin"
++        else
++            echo "Note: the scene size patch is missing: drawing at the game's own 1920x1080" >&2
++            render=; unset BB_RENDER_RES
++        fi
++    fi
++    if [ -n "$parts" ]; then
++        for key in effect_chromatic_aberration effect_dof effect_motion_blur effect_ssao \
++                   effect_game_aa effect_dynamic_shadows effect_ssr skip_intro debug_camera debug_menu model_lod; do
++            value=$(setting "$key")
++            [ -f "$parts/$key=$value.bin" ] && patch_args="$patch_args --patches $parts/$key=$value.bin"
++        done
+     fi
+-    for key in effect_chromatic_aberration effect_dof effect_motion_blur effect_ssao \
+-               effect_game_aa effect_dynamic_shadows effect_ssr skip_intro debug_camera debug_menu model_lod; do
+-        value=$(setting "$key")
+-        [ -f "$parts/$key=$value.bin" ] && patch_args="$patch_args --patches $parts/$key=$value.bin"
+-    done
+     # Frame rate: the hooks (libbbgpu) or, with BB_FRAME_HOOKS=0, the community patch above 30 FPS (and with
+     # frame generation at 30: fps_limit=30-delta). If the hooks cannot install, bb-probe applies the patch
+     # as the fallback (the hooks write nothing then).
+-    if [ "$frame_hooks" = 1 ]; then
+-        patch_args="$patch_args --fallback-patches $parts/fps=uncap.bin"
+-    elif [ "$fps_limit" != 30 ]; then
+-        patch_args="$patch_args --patches $parts/fps=uncap.bin"
++    if [ -n "$parts" ] && [ -f "$parts/fps=uncap.bin" ]; then
++        if [ "$frame_hooks" = 1 ]; then
++            patch_args="$patch_args --fallback-patches $parts/fps=uncap.bin"
++        elif [ "$fps_limit" != 30 ]; then
++            patch_args="$patch_args --patches $parts/fps=uncap.bin"
++        fi
+     fi
+     # The GX per-frame command heaps at 1 MiB (upstream #162; BB_GX_COMMAND_HEAP=0: the game's 256 KiB).
+     [ "${BB_GX_COMMAND_HEAP:-1}" != 0 ] && [ -f "$parts/gx-heap.bin" ] &&
