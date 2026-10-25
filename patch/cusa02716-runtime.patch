@@ -1018,10 +1018,18 @@ index d0fae6f..7603068 100644
  }
  /* Same symbol name means same contract whether imported from libkernel or
 diff --git a/src/runtime.h b/src/runtime.h
-index b0a3b16..9a51ffe 100644
+index b0a3b16..a631793 100644
 --- a/src/runtime.h
 +++ b/src/runtime.h
-@@ -178,6 +178,7 @@
+@@ -173,11 +173,15 @@
+ unsigned runtime_sema_waiters(uint32_t id);
+ uintptr_t runtime_time_resolve(const char *name);
+ void runtime_content_configure(const uint32_t values[5]);
++/* Reads SERVICE_ID_ADDCONT_ADD_1..7 and TITLE_ID out of the title's param.sfo, so add-on lists
++ * can be answered per service label (see runtime_content.c). */
++void runtime_content_link_services(const char *sfo_path);
+ uintptr_t runtime_content_resolve(const char *name);
+ void runtime_content_report(void);
  typedef struct { const char *name; void *function; } RuntimeExport;
  #define RUNTIME_LOOKUP(table, nid) runtime_lookup(table, sizeof(table)/sizeof(*(table)), nid)
  const char *runtime_symbol(const char *nid);
@@ -1029,7 +1037,7 @@ index b0a3b16..9a51ffe 100644
  uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *nid);
  uintptr_t runtime_kernel_resolve(const char *name);
  uintptr_t runtime_file_resolve(const char *name);
-@@ -227,6 +228,16 @@
+@@ -227,6 +231,16 @@
  void runtime_ajm_report(void);
  uintptr_t runtime_audio_resolve(const char *name);
  void runtime_audio_report(void);
@@ -1065,24 +1073,157 @@ index 2bd3e70..6956cfa 100644
 +}
  void runtime_audio_report(void) { printf("Runtime: audio ports opened=%zu, buffers output=%zu\n",ports_opened,buffers_out); }
 diff --git a/src/runtime_content.c b/src/runtime_content.c
-index 9ba5f54..d2545b1 100644
+index 9ba5f54..84b92db 100644
 --- a/src/runtime_content.c
 +++ b/src/runtime_content.c
-@@ -16,6 +16,7 @@
+@@ -1,6 +1,7 @@
+ /* Offline AppContent provider for the configured base-game profile.
+  * No package/DLC mounting, downloads, entitlement or license emulation; The Old Hunters and
+- * add-on folders in <user>/addcont are reported as installed (see addon_list). */
++ * add-on folders in <user>/addcont are reported as installed, per service label (see addon_list
++ * and runtime_content_link_services). */
+ #ifndef _GNU_SOURCE
+ #define _GNU_SOURCE
+ #endif
+@@ -16,6 +17,87 @@
  #define NOT_LOADED ((int32_t)0x805a1001)
  #define PARAMETER ((int32_t)0x80d90002)
  #define BUSY ((int32_t)0x80d90003)
 +#define CONTENT_NOT_FOUND ((int32_t)0x80d90005)
++#define NO_ENTITLEMENT ((int32_t)0x80d90007)
++#define OLD_HUNTERS "SPEXPANSIONDLC03"
++/* Service labels (shadPS4's app_content.cpp layout): label 0 is the title itself, linked through
++ * CONTENT_ID; labels 1..7 are the additional-content services param.sfo names in
++ * SERVICE_ID_ADDCONT_ADD_1..7. A service id looks like UPXXXX-CUSAXXXXX_XX, so the title id sits at
++ * offset 7 (9 chars) and names the addcont folder <user>/addcont/<title id>. CUSA02716 links a
++ * single service, JP0700-CUSA02714_00 (INSTALL_DIR_SAVEDATA is CUSA02714 too): label 1. */
++#define SERVICE_SLOTS 8
++static struct { uint32_t label; char title_id[10]; } services[SERVICE_SLOTS];
++static unsigned service_count, services_linked;
++/* The built-in add-on is the title's linked additional-content service: with one linked service it
++ * is unambiguous, with several the first one is used. */
++static uint32_t builtin_label;
++/* A minimal param.sfo reader: the same table walk probe.c does, kept local so this unit stays
++ * self-contained. Returns 1 when the key exists. */
++static int sfo_text(const char *path, const char *key, char *text, size_t text_size) {
++    FILE *f=fopen(path,"rb");
++    if (!f) return 0;
++    unsigned char data[65536];
++    size_t n=fread(data,1,sizeof(data),f); fclose(f);
++    if (n<20 || memcmp(data,"\0PSF",4)) return 0;
++    uint32_t keys, values, count;
++    memcpy(&keys,data+8,4); memcpy(&values,data+12,4); memcpy(&count,data+16,4);
++    for (uint32_t i=0;i<count && 20+i*16+16<=n;++i) {
++        const unsigned char *e=data+20+i*16;
++        uint16_t key_offset, format; uint32_t length, offset;
++        memcpy(&key_offset,e,2); memcpy(&format,e+2,2); memcpy(&length,e+4,4); memcpy(&offset,e+12,4);
++        if (keys+key_offset>=n || values+offset+length>n || strcmp((const char *)data+keys+key_offset,key)) continue;
++        if (format!=0x0204) return 0;
++        if (text && text_size) {
++            size_t copy=length<text_size-1 ? length : text_size-1;
++            memcpy(text,data+values+offset,copy); text[copy]=0;
++        }
++        return 1;
++    }
++    return 0;
++}
++void runtime_content_link_services(const char *sfo_path) {
++    if (!sfo_path || services_linked) return;
++    services_linked=1;
++    char title[10]="";
++    sfo_text(sfo_path,"TITLE_ID",title,sizeof(title));
++    services[service_count].label=0;
++    snprintf(services[service_count].title_id,sizeof(services[0].title_id),"%s",title);
++    ++service_count;
++    for (uint32_t i=1;i<=7;++i) {
++        char key[32], id[32]="";
++        snprintf(key,sizeof(key),"SERVICE_ID_ADDCONT_ADD_%u",i);
++        if (!sfo_text(sfo_path,key,id,sizeof(id)) || !id[0] || strlen(id)<16) continue;
++        services[service_count].label=i;
++        memcpy(services[service_count].title_id,id+7,9);
++        services[service_count].title_id[9]=0;
++        ++service_count;
++    }
++    builtin_label = service_count>1 ? services[1].label : 0;
++    printf("Runtime: AppContent service labels:");
++    for (unsigned i=0;i<service_count;++i) printf(" %u=%s",services[i].label,services[i].title_id);
++    printf("\n");
++}
++/* Which service label owns an addcont folder, by the title id it is filed under. Before linking
++ * (no param.sfo seen) every folder counts as label 0, the previous behaviour. */
++static uint32_t label_of_title(const char *title_id) {
++    if (!services_linked) return 0;
++    for (unsigned i=0;i<service_count;++i) if (!strcmp(services[i].title_id,title_id)) return services[i].label;
++    return UINT32_MAX;
++}
++/* Is (service label, entitlement label) one this runtime reports? */
++static int addon_known(uint32_t service,const char *label) {
++    if (!label) return 0;
++    if (service==builtin_label && !strcmp(label,OLD_HUNTERS)) return 1;
++    if (!services_linked) return service==0;
++    for (unsigned i=0;i<service_count;++i) {
++        if (services[i].label!=service) continue;
++        char path[4096];
++        snprintf(path,sizeof(path),"%s/addcont/%s/%s",runtime_file_user_dir(),services[i].title_id,label);
++        struct stat entry;
++        if (!stat(path,&entry) && S_ISDIR(entry.st_mode)) return 1;
++    }
++    return 0;
++}
  static unsigned refs, initialized, configured;
  static uint32_t parameters[5];
  static unsigned queries, lists;
-@@ -126,15 +127,36 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
-     if (count) printf("Runtime: AppContent add-ons reported installed (%s%s): %u\n",builtin ? "The Old Hunters, " : "",root,(unsigned)count);
+@@ -86,7 +168,6 @@
+  * add-ons are the folders <user>/addcont/<title id>/<entitlement label> (shadPS4's layout), each
+  * reported as installed. Without a list the count is returned, with one at most capacity entries
+  * are written. Never touch unused list slots. */
+-#define OLD_HUNTERS "SPEXPANSIONDLC03"
+ static void addon_add(void *list,uint32_t capacity,uint32_t *count,const char *label) {
+     if (list && capacity) {
+         if (*count>=capacity) return;
+@@ -99,23 +180,25 @@
+ }
+ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
+     require_initialized();
+-    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
++    if (service>7) return PARAMETER;
+     if ((!capacity || !list) && !hits) return PARAMETER;
+     const char *dlc=getenv("BB_DLC");
+     int builtin=!dlc || strcmp(dlc,"0");
+     uint32_t count=0;
+-    if (builtin) addon_add(list,capacity,&count,OLD_HUNTERS);
++    /* Only the add-ons this service label owns are reported: a console lists per service, and a
++     * title asking for label 1 must not be told about label 0's content. */
++    if (builtin && service==builtin_label) addon_add(list,capacity,&count,OLD_HUNTERS);
+     char root[4096];
+     snprintf(root,sizeof(root),"%s/addcont",runtime_file_user_dir());
+     DIR *titles=opendir(root);
+     for (struct dirent *t; titles && (t=readdir(titles));) {
+-        if (t->d_name[0]=='.') continue;
++        if (t->d_name[0]=='.' || label_of_title(t->d_name)!=service) continue;
+         int title=openat(dirfd(titles),t->d_name,O_RDONLY|O_DIRECTORY);
+         DIR *labels=title>=0 ? fdopendir(title) : NULL;
+         if (!labels && title>=0) close(title);
+         for (struct dirent *l; labels && (l=readdir(labels));) {
+             struct stat entry;
+-            if (l->d_name[0]=='.' || strlen(l->d_name)>=LABEL_SIZE || (builtin && !strcmp(l->d_name,OLD_HUNTERS)) ||
++            if (l->d_name[0]=='.' || strlen(l->d_name)>=LABEL_SIZE || (builtin && service==builtin_label && !strcmp(l->d_name,OLD_HUNTERS)) ||
+                 fstatat(dirfd(labels),l->d_name,&entry,0) || !S_ISDIR(entry.st_mode)) continue;
+             addon_add(list,capacity,&count,l->d_name);
+         }
+@@ -123,18 +206,43 @@
+     }
+     if (titles) closedir(titles);
+     if (hits) *hits=count;
+-    if (count) printf("Runtime: AppContent add-ons reported installed (%s%s): %u\n",builtin ? "The Old Hunters, " : "",root,(unsigned)count);
++    if (count) printf("Runtime: AppContent service %u add-ons reported installed (%s%s): %u\n",(unsigned)service,builtin && service==builtin_label ? "The Old Hunters, " : "",root,(unsigned)count);
      ++lists; return 0;
  }
-+/* DLC mounting (CUSA02716). This fork provides the base game only, so these answer exactly as a
-+ * console does when no add-on is installed: mount and the entitlement key report NOT_FOUND and
-+ * the title takes its "no DLC" path instead of reading a mount that is not there. */
++/* DLC mounting (CUSA02716). This fork provides the base game only, so mounting answers exactly as a
++ * console does when the add-on is not installed: CONTENT_NOT_FOUND, and the title takes its "no
++ * DLC" path instead of reading a mount that is not there. The entitlement key is answered for
++ * every add-on the list reports, with the zeroed key shadPS4 leaves when no license file is
++ * readable: a title that asks for the key has already seen the entitlement as installed. */
 +static unsigned mount_attempts;
 +static ABI int32_t addcont_mount(uint32_t service_label,const void *label,void *mount_point) {
 +    if (service_label>7 || !label || !mount_point) return PARAMETER;
@@ -1095,7 +1236,9 @@ index 9ba5f54..d2545b1 100644
 +}
 +static ABI int32_t entitlement_key(uint32_t service_label,const void *label,void *key) {
 +    if (service_label>7 || !label || !key) return PARAMETER;
-+    return CONTENT_NOT_FOUND;
++    if (!addon_known(service_label,(const char *)label)) return NO_ENTITLEMENT;
++    memset(key,0,16);
++    return 0;
 +}
  uintptr_t runtime_content_resolve(const char *name) {
 -    if (!strcmp(name,"g8cM39EUZ6o#M#N")) return (uintptr_t)module_load;
@@ -1117,8 +1260,10 @@ index 9ba5f54..d2545b1 100644
  }
  void runtime_content_report(void) {
      printf("Runtime: AppContent references=%u, initialized=%u, parameter queries=%u, list queries=%u\n",refs,initialized,queries,lists);
+-}
 +    if (mount_attempts) printf("Runtime: AppContent DLC mounts requested=%u (no add-on content)\n",mount_attempts);
- }
++}
+\ No newline at end of file
 diff --git a/src/runtime_kernel.c b/src/runtime_kernel.c
 index ba6d645..74bc424 100644
 --- a/src/runtime_kernel.c
@@ -2896,10 +3041,18 @@ index 0000000..6a1d855
 +    printf(")\n");
 +}
 diff --git a/src/probe.c b/src/probe.c
-index 47f2b6e..56b0ec4 100644
+index 47f2b6e..35d2edb 100644
 --- a/src/probe.c
 +++ b/src/probe.c
-@@ -949,6 +949,10 @@
+@@ -794,6 +794,7 @@
+         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
+         sfo_value(sfo,"APP_VER",version,sizeof(version),NULL);
+         runtime_net_configure(app0,serial,title,version);
++        runtime_content_link_services(sfo);
+     }
+     bbgpu_register_kernel();
+ #ifdef _WIN32
+@@ -949,6 +950,10 @@
          t[8] = 0x48; t[9] = 0xb8; memcpy(t + 10, &handler, 8);
          t[18] = 0xff; t[19] = 0xe0;
      }
@@ -2910,7 +3063,7 @@ index 47f2b6e..56b0ec4 100644
      for (uint64_t i = 0; i < nr; ++i) {
          uintptr_t value = relocs[i].kind == 2 ? (uintptr_t)(data_traps + page_size * relocs[i].value + relocs[i].addend)
                          : relocs[i].kind == 1 ? (uintptr_t)(traps + 32 * relocs[i].value)
-@@ -962,9 +966,28 @@
+@@ -962,9 +967,28 @@
                  if (binding_kinds[relocs[i].value]!=relocs[i].kind || !mapped(segments,ns,address,relocs[i].addend+1)) fail("native export kind/range mismatch");
                  value=(uintptr_t)image+address+relocs[i].addend;
              }
