@@ -842,7 +842,7 @@ index 0de63f0..a46d5b1 100644
          image_hash = image_hash or image_sha256(game)
          if image_hash == SUPPORTED_IMAGE:
 diff --git a/src/runtime.c b/src/runtime.c
-index d0fae6f..1e4f5f5 100644
+index d0fae6f..4c76565 100644
 --- a/src/runtime.c
 +++ b/src/runtime.c
 @@ -9,6 +9,7 @@
@@ -853,7 +853,16 @@ index d0fae6f..1e4f5f5 100644
  
  typedef struct {
      union { GuestCallback plain; void (ABI *with_arg)(void *); } callback;
-@@ -199,6 +200,13 @@ static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
+@@ -96,6 +97,8 @@
+     runtime_memory_report();
+     runtime_ajm_report();
+     runtime_audio_report();
++    runtime_ngs2_report();
++    runtime_platform_report();
+     runtime_pad_report();
+     runtime_savedata_report();
+     runtime_file_report();
+@@ -199,6 +202,46 @@
      atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcmp(a, b, size);
  }
  static ABI size_t guest_strlen(const char *text) { return strlen(text); }
@@ -864,10 +873,43 @@ index d0fae6f..1e4f5f5 100644
 +    if (sine) *sine = s;
 +    if (cosine) *cosine = c;
 +}
++/* libSceLibcInternal's bounds-checked copies (the MSVC secure CRT contract the PS4 SDK's internal
++ * libc follows): 0 on success, 22 (EINVAL) for a null or overlapping argument, 34 (ERANGE) when the
++ * result does not fit, and the destination is emptied on either failure so a caller that ignores the
++ * code cannot read stale bytes. CUSA02716 imports all three (analysis.json index 83, 199, 590);
++ * without them the first string built after startup stops the game. */
++static ABI int guest_strcpy_s(char *dest, size_t dest_size, const char *source) {
++    size_t length;
++    if (!dest || !dest_size) return 22;
++    if (!source) { dest[0] = 0; return 22; }
++    length = strlen(source);
++    if (length + 1 > dest_size) { dest[0] = 0; return 34; }
++    memcpy(dest, source, length + 1);
++    return 0;
++}
++static ABI int guest_strcat_s(char *dest, size_t dest_size, const char *source) {
++    size_t used = 0, length;
++    if (!dest || !dest_size) return 22;
++    while (used < dest_size && dest[used]) ++used;
++    if (used >= dest_size) { dest[0] = 0; return 22; }   /* unterminated destination */
++    if (!source) { dest[0] = 0; return 22; }
++    length = strlen(source);
++    if (used + length + 1 > dest_size) { dest[0] = 0; return 34; }
++    memcpy(dest + used, source, length + 1);
++    return 0;
++}
++static ABI int guest_memcpy_s(void *dest, size_t dest_size, const void *source, size_t count) {
++    if (!dest) return 22;
++    if (!count) return 0;
++    if (!source) { memset(dest, 0, dest_size < count ? dest_size : count); return 22; }
++    if (count > dest_size) { memset(dest, 0, dest_size); return 34; }
++    memmove(dest, source, count);
++    return 0;
++}
  static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
      printf("Runtime: guest requested exit(%d)\n", status);
      runtime_finalize(NULL);
-@@ -209,29 +217,30 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
+@@ -209,29 +252,33 @@
      if (!(capabilities & 1)) return 0;
      if (is_data) {
          static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
@@ -911,13 +953,27 @@ index d0fae6f..1e4f5f5 100644
 +    if (runtime_key_match(name, "DfivPArhucg#q#q")) return (uintptr_t)guest_memcmp;
 +    if (runtime_key_match(name, "j4ViWNHEgww#q#q")) return (uintptr_t)guest_strlen;
 +    if (runtime_key_match(name, "pztV4AF18iI#")) return (uintptr_t)guest_sincosf;
++    if (runtime_key_match(name, "5Xa2ACNECdo#")) return (uintptr_t)guest_strcpy_s;
++    if (runtime_key_match(name, "K+gcnFFJKVc#")) return (uintptr_t)guest_strcat_s;
++    if (runtime_key_match(name, "NFLs+dRJGNg#")) return (uintptr_t)guest_memcpy_s;
 +    if (runtime_key_match(name, "vNe1w4diLCs#p#J")) return (uintptr_t)guest_tls_get_addr;
 +    if (runtime_key_match(name, "959qrazPIrg#p#J")) return (uintptr_t)guest_procparam;
 +    if (runtime_key_match(name, "p5EcQeEeJAE#p#J")) return (uintptr_t)guest_set_heap_api;
      uintptr_t mutex = runtime_mutex_resolve(name);
      if (mutex) return mutex;
      uintptr_t thread = runtime_thread_resolve(name);
-@@ -267,10 +276,32 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
+@@ -254,6 +301,10 @@
+     if (ajm) return ajm;
+     uintptr_t audio = runtime_audio_resolve(name);
+     if (audio) return audio;
++    uintptr_t ngs2 = runtime_ngs2_resolve(name);
++    if (ngs2) return ngs2;
++    uintptr_t platform = runtime_platform_resolve(name);
++    if (platform) return platform;
+     uintptr_t pad = runtime_pad_resolve(name);
+     if (pad) return pad;
+     uintptr_t rtc = runtime_rtc_resolve(name);
+@@ -267,10 +318,32 @@
  static const struct { const char *nid, *symbol; } import_names[]={
  #include "import_names.inc"
  };
@@ -952,10 +1008,10 @@ index d0fae6f..1e4f5f5 100644
  }
  /* Same symbol name means same contract whether imported from libkernel or
 diff --git a/src/runtime.h b/src/runtime.h
-index b0a3b16..a6b8149 100644
+index b0a3b16..d0ae198 100644
 --- a/src/runtime.h
 +++ b/src/runtime.h
-@@ -178,6 +178,7 @@ void runtime_content_report(void);
+@@ -178,6 +178,7 @@
  typedef struct { const char *name; void *function; } RuntimeExport;
  #define RUNTIME_LOOKUP(table, nid) runtime_lookup(table, sizeof(table)/sizeof(*(table)), nid)
  const char *runtime_symbol(const char *nid);
@@ -963,6 +1019,17 @@ index b0a3b16..a6b8149 100644
  uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *nid);
  uintptr_t runtime_kernel_resolve(const char *name);
  uintptr_t runtime_file_resolve(const char *name);
+@@ -227,6 +228,10 @@
+ void runtime_ajm_report(void);
+ uintptr_t runtime_audio_resolve(const char *name);
+ void runtime_audio_report(void);
++uintptr_t runtime_ngs2_resolve(const char *name);
++void runtime_ngs2_report(void);
++uintptr_t runtime_platform_resolve(const char *name);
++void runtime_platform_report(void);
+ uintptr_t runtime_pad_resolve(const char *name);
+ void runtime_pad_report(void);
+ uintptr_t runtime_rtc_resolve(const char *name);
 diff --git a/src/runtime_audio.c b/src/runtime_audio.c
 index 2bd3e70..6956cfa 100644
 --- a/src/runtime_audio.c
@@ -2053,3 +2120,762 @@ diff --git a/tools/android/frontend/src/ro/cobrabm/fexdroid/NativeCpu.java b/too
          if (info.gameVersion != null && !GameCheck.SUPPORTED_VERSION.equals(info.gameVersion))
              return "It was built from game version " + info.gameVersion + "; the app runs version " + GameCheck.SUPPORTED_VERSION + ".";
          if (gameVersion != null && info.gameVersion != null && !gameVersion.equals(info.gameVersion))
+diff --git a/src/runtime_ngs2.c b/src/runtime_ngs2.c
+new file mode 100644
+index 0000000..a60167f
+--- /dev/null
++++ b/src/runtime_ngs2.c
+@@ -0,0 +1,664 @@
++/* libSceNgs2: the audio render graph. CUSA02716 imports exactly twelve of its functions, and they
++ * are a closed set: create a system and a rack from memory the game allocates itself, hand out the
++ * rack's voice handles, set the sample rate and the grain size, control the voices, read their
++ * state, render one grain per call, destroy. This backend owns that state and is silent: it zeroes
++ * every output buffer it is handed, so the game's mixer thread runs at its own pace and the audio
++ * port opened by runtime_audio.c (which the game feeds from these buffers) carries silence.
++ *
++ * No DSP graph is emulated (no sampler, envelope, reverb, matrix or codec work), so the game has
++ * no sound. Everything the game can observe through this API stays consistent: handles are valid
++ * for their lifetime, the game's own alloc/free callbacks are called exactly as the hardware
++ * library calls them (the game keeps ownership of the memory), a voice is always reported idle, so
++ * a voice pool never runs dry and no caller waits for a sound to finish.
++ *
++ * The stop this replaces was `first unsupported PS4 import: mPYgU4oYpuY#1#v` (index 247,
++ * sceNgs2SystemCreateWithAllocator) at caller offset 0x2d8a28. */
++#define _GNU_SOURCE
++#include "runtime.h"
++#include "guest_cpu.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <pthread.h>
++
++#define ERR_FAIL                     ((int32_t)0x804A0001)
++#define ERR_INVALID_OPTION_ADDRESS   ((int32_t)0x804A0080)
++#define ERR_INVALID_OPTION_SIZE      ((int32_t)0x804A0081)
++#define ERR_INVALID_OUT_ADDRESS      ((int32_t)0x804A0053)
++#define ERR_INVALID_BUFFER_INFO      ((int32_t)0x804A0206)
++#define ERR_INVALID_BUFFER_SIZE      ((int32_t)0x804A0209)
++#define ERR_INVALID_BUFFER_ALLOCATOR ((int32_t)0x804A020A)
++#define ERR_INVALID_SYSTEM_HANDLE    ((int32_t)0x804A0230)
++#define ERR_INVALID_RACK_HANDLE      ((int32_t)0x804A0261)
++#define ERR_INVALID_VOICE_HANDLE     ((int32_t)0x804A0300)
++#define ERR_INVALID_VOICE_STATE_SIZE ((int32_t)0x804A0A06)
++
++#define MAX_SYSTEMS 8
++#define MAX_RACKS 32
++#define MAX_VOICES 256
++#define MAX_PARAMS 64
++#define MAX_ZERO_BYTES (4u << 20) /* never zero more than this per buffer, whatever the game says */
++
++/* Handles are opaque to the game; a tag keeps a stray value from being mistaken for one. */
++#define HANDLE_TAG 0x4E470000u
++enum { HANDLE_SYSTEM = 1, HANDLE_RACK = 2, HANDLE_VOICE = 3 };
++#define MAKE_HANDLE(type, index) ((uintptr_t)(HANDLE_TAG | ((uint32_t)(type) << 12) | (uint32_t)(index)))
++#define HANDLE_TYPE(handle) (((uintptr_t)(handle) & 0xF000u) >> 12)
++#define HANDLE_INDEX(handle) ((uintptr_t)(handle) & 0xFFFu)
++#define HANDLE_VALID(handle, type, index) \
++    (((uintptr_t)(handle) & 0xFFFF0000u) == HANDLE_TAG && HANDLE_TYPE(handle) == (type) && \
++     HANDLE_INDEX(handle) == (uintptr_t)(index))
++
++typedef struct { /* OrbisNgs2ContextBufferInfo: what the game's allocator fills in and gets back */
++    void *host_buffer;
++    size_t host_buffer_size;
++    uintptr_t reserved[5];
++    uintptr_t user_data;
++} Ngs2BufferInfo;
++
++typedef struct { /* OrbisNgs2SystemOption */
++    size_t size;
++    char name[16];
++    uint32_t flags;
++    uint32_t max_grain_samples;
++    uint32_t num_grain_samples;
++    uint32_t sample_rate;
++    uint32_t reserved[6];
++} Ngs2SystemOption;
++
++typedef struct { /* OrbisNgs2RackOption */
++    size_t size;
++    char name[16];
++    uint32_t flags;
++    uint32_t max_grain_samples;
++    uint32_t max_voices;
++    uint32_t max_input_delay_blocks;
++    uint32_t max_matrices;
++    uint32_t max_ports;
++    uint32_t reserved[20];
++} Ngs2RackOption;
++
++typedef struct { /* OrbisNgs2RenderBufferInfo */
++    void *buffer;
++    size_t buffer_size;
++    uint32_t waveform_type; /* 0 s16, 1 s32, 2 float, as in the AJM decoder in runtime_ajm.c */
++    uint32_t num_channels;
++} Ngs2RenderBuffer;
++
++typedef struct { /* OrbisNgs2VoiceParamHeader: a linked list of parameters */
++    uint16_t size;
++    int16_t next; /* offset from this entry to the next, 0: last */
++    uint32_t id;
++} Ngs2ParamHeader;
++
++typedef struct { /* OrbisNgs2WaveformFormat */
++    uint32_t waveform_type;
++    uint32_t num_channels;
++    uint32_t sample_rate;
++    uint32_t config_data;
++    uint32_t frame_offset;
++    uint32_t frame_margin;
++} Ngs2WaveformFormat;
++
++typedef struct { /* OrbisNgs2WaveformBlock */
++    uint32_t data_offset;
++    uint32_t data_size;
++    uint32_t num_repeats;
++    uint32_t num_skip_samples;
++    uint32_t num_samples;
++    uint32_t reserved;
++    uintptr_t user_data;
++} Ngs2WaveformBlock;
++
++typedef struct { /* OrbisNgs2WaveformInfo */
++    Ngs2WaveformFormat format;
++    uint32_t data_offset;
++    uint32_t data_size;
++    uint32_t loop_begin_position;
++    uint32_t loop_end_position;
++    uint32_t num_samples;
++    uint32_t audio_unit_size;
++    uint32_t num_audio_unit_samples;
++    uint32_t num_audio_unit_per_frame;
++    uint32_t audio_frame_size;
++    uint32_t num_audio_frame_samples;
++    uint32_t num_delay_samples;
++    uint32_t num_blocks;
++    Ngs2WaveformBlock block[4];
++} Ngs2WaveformInfo;
++
++typedef struct { /* OrbisNgs2VoiceState */
++    uint32_t state_flags;
++} Ngs2VoiceState;
++
++_Static_assert(sizeof(Ngs2BufferInfo) == 64, "OrbisNgs2ContextBufferInfo layout");
++_Static_assert(sizeof(Ngs2SystemOption) == 64, "OrbisNgs2SystemOption layout");
++_Static_assert(sizeof(Ngs2RackOption) == 128, "OrbisNgs2RackOption layout");
++_Static_assert(sizeof(Ngs2RenderBuffer) == 24, "OrbisNgs2RenderBufferInfo layout");
++_Static_assert(sizeof(Ngs2ParamHeader) == 8, "OrbisNgs2VoiceParamHeader layout");
++_Static_assert(sizeof(Ngs2WaveformInfo) == 200, "OrbisNgs2WaveformInfo layout");
++
++typedef int32_t(ABI *Ngs2BufferHandler)(Ngs2BufferInfo *info);
++
++/* The game's handlers are guest code: on AArch64 they exist only as recompiled units, so the call
++ * has to go through the guest CPU's dispatcher (guest_cpu.h), never through the raw pointer.
++ * Called from inside the guest's own call into this file, so it runs on the guest stack. */
++static int32_t call_buffer_handler(Ngs2BufferHandler handler, Ngs2BufferInfo *info) {
++    const uint64_t argument = (uint64_t)(uintptr_t)info;
++    return (int32_t)guest_cpu_call((uintptr_t)handler, 1, &argument);
++}
++
++typedef struct { /* OrbisNgs2BufferAllocator: the game's own alloc/free pair */
++    Ngs2BufferHandler alloc_handler;
++    Ngs2BufferHandler free_handler;
++    uintptr_t user_data;
++} Ngs2Allocator;
++
++_Static_assert(sizeof(Ngs2Allocator) == 24, "OrbisNgs2BufferAllocator layout");
++
++typedef struct {
++    int used;
++    uint32_t sample_rate, grain_samples, max_grain_samples;
++    char name[17];
++    Ngs2BufferInfo buffer;      /* what the game's allocator handed over */
++    Ngs2BufferHandler host_free;
++    int owns_buffer;            /* no allocator: the buffer is this file's malloc */
++    size_t rack_count;
++} Ngs2System;
++
++typedef struct {
++    int used;
++    uintptr_t system;           /* owning system handle */
++    uint32_t max_voices, max_matrices, max_ports, rack_id;
++    char name[17];
++    Ngs2BufferInfo buffer;
++    Ngs2BufferHandler host_free;
++    int owns_buffer;
++} Ngs2Rack;
++
++typedef struct {
++    int used;
++    uintptr_t rack;
++    uint32_t index;
++    uint64_t control_calls;
++} Ngs2Voice;
++
++static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
++static Ngs2System systems[MAX_SYSTEMS];
++static Ngs2Rack racks[MAX_RACKS];
++static Ngs2Voice voices[MAX_VOICES];
++static size_t systems_created, racks_created, voices_created, control_calls, render_calls, grains;
++static size_t render_errors, waveform_calls;
++static uint32_t last_render_buffers, last_render_size, last_render_type, last_render_channels;
++
++static Ngs2System *system_of(uintptr_t handle) {
++    size_t index;
++    if (HANDLE_TYPE(handle) != HANDLE_SYSTEM) return NULL;
++    index = (size_t)HANDLE_INDEX(handle);
++    if (index >= MAX_SYSTEMS || !systems[index].used) return NULL;
++    if (!HANDLE_VALID(handle, HANDLE_SYSTEM, index)) return NULL;
++    return &systems[index];
++}
++static Ngs2Rack *rack_of(uintptr_t handle) {
++    size_t index;
++    if (HANDLE_TYPE(handle) != HANDLE_RACK) return NULL;
++    index = (size_t)HANDLE_INDEX(handle);
++    if (index >= MAX_RACKS || !racks[index].used) return NULL;
++    if (!HANDLE_VALID(handle, HANDLE_RACK, index)) return NULL;
++    return &racks[index];
++}
++static Ngs2Voice *voice_of(uintptr_t handle) {
++    size_t index;
++    if (HANDLE_TYPE(handle) != HANDLE_VOICE) return NULL;
++    index = (size_t)HANDLE_INDEX(handle);
++    if (index >= MAX_VOICES || !voices[index].used) return NULL;
++    if (!HANDLE_VALID(handle, HANDLE_VOICE, index)) return NULL;
++    return &voices[index];
++}
++static int first_free(int *used, size_t count, size_t stride) {
++    for (size_t i = 0; i < count; ++i)
++        if (!*(int *)((char *)used + i * stride)) return (int)i;
++    return -1;
++}
++
++/* The size the hardware library would ask the game's allocator for. The game mallocs this and owns
++ * it, so it only has to be plausible and small: asking for more than the game's pool holds would
++ * make its own allocator fail the whole create. */
++static size_t system_buffer_size(const Ngs2SystemOption *option) {
++    size_t grain = option->max_grain_samples ? option->max_grain_samples : 256;
++    if (grain > 8192) grain = 8192;
++    return 65536 + grain * 64;
++}
++static size_t rack_buffer_size(const Ngs2RackOption *option) {
++    size_t per_voice = 4096 + (option->max_ports ? option->max_ports : 4) * 64;
++    size_t size = 65536 + (option->max_voices ? option->max_voices : 16) * per_voice;
++    if (size > (2u << 20)) size = 2u << 20;
++    return size;
++}
++/* Asks the game's allocator for the memory, or takes this process's own when there is none: the
++ * game's free callback never sees a pointer it does not own. Returns 0 or a Ngs2 error. */
++static int32_t acquire_buffer(size_t size, const Ngs2Allocator *allocator, Ngs2BufferInfo *out,
++                              Ngs2BufferHandler *out_free, int *out_owned) {
++    Ngs2BufferHandler alloc = NULL, release = NULL;
++    memset(out, 0, sizeof(*out));
++    out->host_buffer_size = size;
++    *out_free = NULL;
++    *out_owned = 0;
++    if (allocator) {
++        alloc = allocator->alloc_handler;
++        release = allocator->free_handler;
++        out->user_data = allocator->user_data;
++    }
++    if (!alloc) {
++        /* No allocator: take our own memory and free it here, so a game that only ever used the
++         * WithAllocator entry points still gets a working system. */
++        out->host_buffer = malloc(size);
++        if (!out->host_buffer) return ERR_FAIL;
++        *out_owned = 1;
++        return 0;
++    }
++    if (call_buffer_handler(alloc, out) < 0) {
++        /* The game's own allocator refused; it owns whatever it left in host_buffer, so this file
++         * never frees it (host free() on guest memory would corrupt the heap). */
++        memset(out, 0, sizeof(*out));
++        return ERR_INVALID_BUFFER_ALLOCATOR;
++    }
++    if (!out->host_buffer || out->host_buffer_size < size) {
++        if (out->host_buffer && release) call_buffer_handler(release, out);
++        memset(out, 0, sizeof(*out));
++        return ERR_INVALID_BUFFER_SIZE;
++    }
++    *out_free = release;
++    return 0;
++}
++static void release_buffer(Ngs2BufferInfo *buffer, Ngs2BufferHandler release, int owned,
++                           Ngs2BufferInfo *out) {
++    if (out) *out = *buffer; /* the game frees what its own allocator handed over */
++    if (owned) {
++        free(buffer->host_buffer);
++        if (out) {
++            out->host_buffer = NULL;
++            out->host_buffer_size = 0;
++        }
++    } else if (release) {
++        call_buffer_handler(release, buffer);
++        if (out) {
++            out->host_buffer = NULL;
++            out->host_buffer_size = 0;
++        }
++    }
++    memset(buffer, 0, sizeof(*buffer));
++}
++
++static ABI int32_t ngs2_system_create_with_allocator(const Ngs2SystemOption *option,
++                                                     const Ngs2Allocator *allocator, uintptr_t *out_handle) {
++    Ngs2BufferInfo buffer;
++    Ngs2BufferHandler release = NULL;
++    int32_t error;
++    int owned = 0, slot;
++    if (!out_handle) return ERR_INVALID_OUT_ADDRESS;
++    if (!option) return ERR_INVALID_OPTION_ADDRESS;
++    if (option->size < 32) return ERR_INVALID_OPTION_SIZE;
++    error = acquire_buffer(system_buffer_size(option), allocator, &buffer, &release, &owned);
++    if (error) return error;
++    pthread_mutex_lock(&table_lock);
++    slot = first_free(&systems[0].used, MAX_SYSTEMS, sizeof(Ngs2System));
++    if (slot < 0) {
++        pthread_mutex_unlock(&table_lock);
++        release_buffer(&buffer, release, owned, NULL);
++        return ERR_FAIL;
++    }
++    Ngs2System *system = &systems[slot];
++    memset(system, 0, sizeof(*system));
++    system->used = 1;
++    system->sample_rate = option->sample_rate ? option->sample_rate : 48000;
++    system->grain_samples = option->num_grain_samples ? option->num_grain_samples : 256;
++    system->max_grain_samples = option->max_grain_samples ? option->max_grain_samples : 512;
++    memcpy(system->name, option->name, 16);
++    system->name[16] = 0;
++    system->buffer = buffer;
++    system->host_free = release;
++    system->owns_buffer = owned;
++    *out_handle = MAKE_HANDLE(HANDLE_SYSTEM, slot);
++    systems_created++;
++    uint32_t sample_rate = system->sample_rate, grain = system->grain_samples,
++             max_grain = system->max_grain_samples;
++    uintptr_t handle_out = *out_handle;
++    pthread_mutex_unlock(&table_lock);
++    printf("Runtime: ngs2 system created (sampleRate=%u grainSamples=%u maxGrainSamples=%u "
++           "buffer=%zu bytes) handle=0x%llx\n",
++           sample_rate, grain, max_grain, buffer.host_buffer_size,
++           (unsigned long long)handle_out);
++    return 0;
++}
++static ABI int32_t ngs2_system_destroy(uintptr_t handle, Ngs2BufferInfo *out_buffer) {
++    Ngs2BufferHandler release = NULL;
++    Ngs2BufferInfo buffer;
++    int owned = 0;
++    pthread_mutex_lock(&table_lock);
++    Ngs2System *system = system_of(handle);
++    if (!system) {
++        pthread_mutex_unlock(&table_lock);
++        return ERR_INVALID_SYSTEM_HANDLE;
++    }
++    /* The racks and every voice handle of theirs go with the system that owns them. */
++    for (size_t i = 0; i < MAX_RACKS; ++i) {
++        if (!racks[i].used || racks[i].system != handle) continue;
++        uintptr_t rack_handle = MAKE_HANDLE(HANDLE_RACK, i);
++        for (size_t v = 0; v < MAX_VOICES; ++v)
++            if (voices[v].used && voices[v].rack == rack_handle) voices[v].used = 0;
++        racks[i].used = 0;
++    }
++    buffer = system->buffer;
++    release = system->host_free;
++    owned = system->owns_buffer;
++    memset(system, 0, sizeof(*system));
++    pthread_mutex_unlock(&table_lock);
++    release_buffer(&buffer, release, owned, out_buffer);
++    return 0;
++}
++static ABI int32_t ngs2_system_set_sample_rate(uintptr_t handle, uint32_t sample_rate) {
++    int32_t error = 0;
++    pthread_mutex_lock(&table_lock);
++    Ngs2System *system = system_of(handle);
++    if (system)
++        system->sample_rate = sample_rate ? sample_rate : system->sample_rate;
++    else
++        error = ERR_INVALID_SYSTEM_HANDLE;
++    pthread_mutex_unlock(&table_lock);
++    return error;
++}
++static ABI int32_t ngs2_system_set_grain_samples(uintptr_t handle, uint32_t num_samples) {
++    int32_t error = 0;
++    pthread_mutex_lock(&table_lock);
++    Ngs2System *system = system_of(handle);
++    if (system) {
++        if (num_samples) {
++            system->grain_samples = num_samples;
++            if (system->grain_samples > system->max_grain_samples)
++                system->max_grain_samples = system->grain_samples;
++        }
++    } else {
++        error = ERR_INVALID_SYSTEM_HANDLE;
++    }
++    pthread_mutex_unlock(&table_lock);
++    return error;
++}
++/* One grain of the graph. The graph produces silence: every output buffer is zeroed at the size the
++ * game gave it, which is what the audio port it feeds would otherwise repeat stale samples from. */
++static ABI int32_t ngs2_system_render(uintptr_t handle, const Ngs2RenderBuffer *buffers,
++                                      uint32_t num_buffers) {
++    int32_t error = 0;
++    pthread_mutex_lock(&table_lock);
++    Ngs2System *system = system_of(handle);
++    if (!system) {
++        pthread_mutex_unlock(&table_lock);
++        return ERR_INVALID_SYSTEM_HANDLE;
++    }
++    if (!buffers && num_buffers) {
++        render_errors++;
++        pthread_mutex_unlock(&table_lock);
++        return ERR_INVALID_OUT_ADDRESS;
++    }
++    for (uint32_t i = 0; i < num_buffers; ++i) {
++        size_t size = buffers[i].buffer_size;
++        if (!buffers[i].buffer) {
++            render_errors++;
++            continue;
++        }
++        if (!size) {
++            /* No size given: a grain of this system's format, the minimum the caller can want. */
++            size_t bytes = buffers[i].waveform_type == 0 ? 2 : 4;
++            size_t channels = buffers[i].num_channels ? buffers[i].num_channels : 1;
++            size = (size_t)system->grain_samples * channels * bytes;
++        }
++        if (size > MAX_ZERO_BYTES) size = MAX_ZERO_BYTES;
++        memset(buffers[i].buffer, 0, size);
++        if (i == 0) {
++            last_render_size = (uint32_t)(buffers[i].buffer_size > 0xffffffffu
++                                              ? 0xffffffffu
++                                              : buffers[i].buffer_size);
++            last_render_type = buffers[i].waveform_type;
++            last_render_channels = buffers[i].num_channels;
++        }
++    }
++    last_render_buffers = num_buffers;
++    render_calls++;
++    grains += num_buffers ? num_buffers : 1;
++    pthread_mutex_unlock(&table_lock);
++    return error;
++}
++
++static ABI int32_t ngs2_rack_create_with_allocator(uintptr_t system_handle, uint32_t rack_id,
++                                                   const Ngs2RackOption *option,
++                                                   const Ngs2Allocator *allocator, uintptr_t *out_handle) {
++    Ngs2BufferInfo buffer;
++    Ngs2BufferHandler release = NULL;
++    int32_t error;
++    int owned = 0, slot;
++    if (!out_handle) return ERR_INVALID_OUT_ADDRESS;
++    if (!option) return ERR_INVALID_OPTION_ADDRESS;
++    if (option->size < 40) return ERR_INVALID_OPTION_SIZE;
++    pthread_mutex_lock(&table_lock);
++    Ngs2System *system = system_of(system_handle);
++    pthread_mutex_unlock(&table_lock);
++    if (!system) return ERR_INVALID_SYSTEM_HANDLE;
++    error = acquire_buffer(rack_buffer_size(option), allocator, &buffer, &release, &owned);
++    if (error) return error;
++    pthread_mutex_lock(&table_lock);
++    slot = first_free(&racks[0].used, MAX_RACKS, sizeof(Ngs2Rack));
++    system = system_of(system_handle);
++    if (slot < 0 || !system) {
++        pthread_mutex_unlock(&table_lock);
++        release_buffer(&buffer, release, owned, NULL);
++        return slot < 0 ? ERR_FAIL : ERR_INVALID_SYSTEM_HANDLE;
++    }
++    Ngs2Rack *rack = &racks[slot];
++    memset(rack, 0, sizeof(*rack));
++    rack->used = 1;
++    rack->system = system_handle;
++    rack->rack_id = rack_id;
++    rack->max_voices = option->max_voices ? option->max_voices : 16;
++    if (rack->max_voices > MAX_VOICES) rack->max_voices = MAX_VOICES;
++    rack->max_matrices = option->max_matrices;
++    rack->max_ports = option->max_ports;
++    memcpy(rack->name, option->name, 16);
++    rack->name[16] = 0;
++    rack->buffer = buffer;
++    rack->host_free = release;
++    rack->owns_buffer = owned;
++    system->rack_count++;
++    *out_handle = MAKE_HANDLE(HANDLE_RACK, slot);
++    racks_created++;
++    uint32_t max_voices = rack->max_voices, max_matrices = rack->max_matrices,
++             max_ports = rack->max_ports;
++    pthread_mutex_unlock(&table_lock);
++    printf("Runtime: ngs2 rack created (rackId=%u maxVoices=%u maxMatrices=%u maxPorts=%u "
++           "buffer=%zu bytes)\n",
++           rack_id, max_voices, max_matrices, max_ports, buffer.host_buffer_size);
++    return 0;
++}
++static ABI int32_t ngs2_rack_destroy(uintptr_t handle, Ngs2BufferInfo *out_buffer) {
++    Ngs2BufferHandler release = NULL;
++    Ngs2BufferInfo buffer;
++    int owned = 0;
++    pthread_mutex_lock(&table_lock);
++    Ngs2Rack *rack = rack_of(handle);
++    if (!rack) {
++        pthread_mutex_unlock(&table_lock);
++        return ERR_INVALID_RACK_HANDLE;
++    }
++    for (size_t i = 0; i < MAX_VOICES; ++i)
++        if (voices[i].used && voices[i].rack == handle) voices[i].used = 0;
++    buffer = rack->buffer;
++    release = rack->host_free;
++    owned = rack->owns_buffer;
++    memset(rack, 0, sizeof(*rack));
++    pthread_mutex_unlock(&table_lock);
++    release_buffer(&buffer, release, owned, out_buffer);
++    return 0;
++}
++/* The voice handles belong to the rack: the game asks for each index once and reuses the handle. */
++static ABI int32_t ngs2_rack_get_voice_handle(uintptr_t handle, uint32_t voice_index,
++                                              uintptr_t *out_handle) {
++    int32_t error = 0;
++    int slot = -1;
++    if (!out_handle) return ERR_INVALID_OUT_ADDRESS;
++    pthread_mutex_lock(&table_lock);
++    Ngs2Rack *rack = rack_of(handle);
++    if (!rack) {
++        error = ERR_INVALID_RACK_HANDLE;
++    } else if (voice_index >= rack->max_voices) {
++        printf("Runtime: ngs2 rack voice %u is out of range (maxVoices=%u)\n", voice_index,
++               rack->max_voices);
++        error = ERR_INVALID_VOICE_HANDLE;
++    } else {
++        for (size_t i = 0; i < MAX_VOICES; ++i) {
++            if (voices[i].used && voices[i].rack == handle && voices[i].index == voice_index) {
++                slot = (int)i;
++                break;
++            }
++        }
++        if (slot < 0) slot = first_free(&voices[0].used, MAX_VOICES, sizeof(Ngs2Voice));
++        if (slot < 0) {
++            error = ERR_FAIL;
++        } else {
++            voices[slot].used = 1;
++            voices[slot].rack = handle;
++            voices[slot].index = voice_index;
++            voices_created++;
++            *out_handle = MAKE_HANDLE(HANDLE_VOICE, slot);
++        }
++    }
++    pthread_mutex_unlock(&table_lock);
++    return error;
++}
++
++/* The parameter list is a chain of OrbisNgs2VoiceParamHeader entries (size, offset to the next,
++ * id). Nothing is applied: the graph is silent, so a volume, matrix, envelope, waveform block or
++ * key-on has nothing to act on. The ids are counted so a log shows what the game asks for. */
++static ABI int32_t ngs2_voice_control(uintptr_t handle, const Ngs2ParamHeader *params) {
++    const char *cursor = (const char *)params;
++    uint32_t applied = 0, last_id = 0;
++    int32_t error = 0;
++    pthread_mutex_lock(&table_lock);
++    Ngs2Voice *voice = voice_of(handle);
++    if (!voice) {
++        error = ERR_INVALID_VOICE_HANDLE;
++    } else {
++        for (uint32_t i = 0; cursor && i < MAX_PARAMS; ++i) {
++            Ngs2ParamHeader header;
++            memcpy(&header, cursor, sizeof(header));
++            if (header.size < (uint16_t)sizeof(Ngs2ParamHeader)) break;
++            applied++;
++            last_id = header.id;
++            if (!header.next || header.next < (int16_t)header.size) break;
++            cursor += header.next;
++        }
++        if (params) {
++            voice->control_calls++;
++            control_calls++;
++            if (control_calls <= 4 || applied > 8)
++                printf("Runtime: ngs2 voice control (voice %u, %u params, last id 0x%x)\n",
++                       voice->index, applied, last_id);
++        }
++    }
++    pthread_mutex_unlock(&table_lock);
++    return error;
++}
++/* A voice is always idle: the graph plays nothing, so the game's voice pool recycles immediately
++ * instead of waiting for a sound that will never finish. */
++static ABI int32_t ngs2_voice_get_state(uintptr_t handle, Ngs2VoiceState *out_state,
++                                        size_t state_size) {
++    int32_t error = 0;
++    pthread_mutex_lock(&table_lock);
++    if (!voice_of(handle)) error = ERR_INVALID_VOICE_HANDLE;
++    pthread_mutex_unlock(&table_lock);
++    if (error) return error;
++    if (!out_state) return ERR_INVALID_OUT_ADDRESS;
++    if (state_size < sizeof(Ngs2VoiceState)) return ERR_INVALID_VOICE_STATE_SIZE;
++    memset(out_state, 0, state_size < sizeof(*out_state) ? state_size : sizeof(*out_state));
++    return 0;
++}
++static ABI int32_t ngs2_voice_get_state_flags(uintptr_t handle, uint32_t *out_flags) {
++    int32_t error = 0;
++    pthread_mutex_lock(&table_lock);
++    if (!voice_of(handle)) error = ERR_INVALID_VOICE_HANDLE;
++    pthread_mutex_unlock(&table_lock);
++    if (error) return error;
++    if (!out_flags) return ERR_INVALID_OUT_ADDRESS;
++    *out_flags = 0;
++    return 0;
++}
++/* The waveform the game parses is described back as empty (zero samples): the mixer plays nothing,
++ * so a sound built from it never renders. The first call's header is printed once, which is what
++ * identifies the container when a real decoder is added. */
++static ABI int32_t ngs2_parse_waveform_data(const void *data, size_t data_size,
++                                            Ngs2WaveformInfo *out_info) {
++    if (!out_info) return ERR_INVALID_OUT_ADDRESS;
++    memset(out_info, 0, sizeof(*out_info));
++    waveform_calls++;
++    if (waveform_calls == 1) {
++        const unsigned char *bytes = data;
++        char text[17];
++        size_t i, shown = 0;
++        for (i = 0; i < 16 && i < data_size; ++i) {
++            unsigned char c = bytes[i];
++            text[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
++        }
++        text[i] = 0;
++        shown = i;
++        printf("Runtime: ngs2 waveform parse: %zu bytes, header \"%s\" (%02x %02x %02x %02x %02x "
++               "%02x %02x %02x), reported as empty\n",
++               data_size, text, shown > 0 ? bytes[0] : 0, shown > 1 ? bytes[1] : 0,
++               shown > 2 ? bytes[2] : 0, shown > 3 ? bytes[3] : 0, shown > 4 ? bytes[4] : 0,
++               shown > 5 ? bytes[5] : 0, shown > 6 ? bytes[6] : 0, shown > 7 ? bytes[7] : 0);
++    }
++    return 0;
++}
++
++static const RuntimeExport exports[] = {
++    {"sceNgs2SystemCreateWithAllocator", ngs2_system_create_with_allocator},
++    {"sceNgs2SystemDestroy", ngs2_system_destroy},
++    {"sceNgs2SystemSetSampleRate", ngs2_system_set_sample_rate},
++    {"sceNgs2SystemSetGrainSamples", ngs2_system_set_grain_samples},
++    {"sceNgs2SystemRender", ngs2_system_render},
++    {"sceNgs2RackCreateWithAllocator", ngs2_rack_create_with_allocator},
++    {"sceNgs2RackDestroy", ngs2_rack_destroy},
++    {"sceNgs2RackGetVoiceHandle", ngs2_rack_get_voice_handle},
++    {"sceNgs2VoiceControl", ngs2_voice_control},
++    {"sceNgs2VoiceGetState", ngs2_voice_get_state},
++    {"sceNgs2VoiceGetStateFlags", ngs2_voice_get_state_flags},
++    {"sceNgs2ParseWaveformData", ngs2_parse_waveform_data},
++};
++uintptr_t runtime_ngs2_resolve(const char *name) {
++    const uintptr_t symbol = RUNTIME_LOOKUP(exports, name);
++    if (symbol) return symbol;
++    /* import_names.inc was generated from another title and has no libSceNgs2 entry, so the twelve
++     * NIDs CUSA02716 imports (index 241..253 of analysis.json's import list) are bound by NID.
++     * runtime_key_match compares the eleven NID characters, so the `#library#module` suffix this
++     * image spells (`#1#v`) does not matter. */
++    if (runtime_key_match(name, "hyVLT2VlOYk#")) return (uintptr_t)ngs2_parse_waveform_data;
++    if (runtime_key_match(name, "uu94irFOGpA#")) return (uintptr_t)ngs2_voice_control;
++    if (runtime_key_match(name, "rEh728kXk3w#")) return (uintptr_t)ngs2_voice_get_state_flags;
++    if (runtime_key_match(name, "-TOuuAQ-buE#")) return (uintptr_t)ngs2_voice_get_state;
++    if (runtime_key_match(name, "i0VnXM-C9fc#")) return (uintptr_t)ngs2_system_render;
++    if (runtime_key_match(name, "mPYgU4oYpuY#")) return (uintptr_t)ngs2_system_create_with_allocator;
++    if (runtime_key_match(name, "U546k6orxQo#")) return (uintptr_t)ngs2_rack_create_with_allocator;
++    if (runtime_key_match(name, "MwmHz8pAdAo#")) return (uintptr_t)ngs2_rack_get_voice_handle;
++    if (runtime_key_match(name, "-tbc2SxQD60#")) return (uintptr_t)ngs2_system_set_sample_rate;
++    if (runtime_key_match(name, "l4Q2dWEH6UM#")) return (uintptr_t)ngs2_system_set_grain_samples;
++    if (runtime_key_match(name, "lCqD7oycmIM#")) return (uintptr_t)ngs2_rack_destroy;
++    if (runtime_key_match(name, "u-WrYDaJA3k#")) return (uintptr_t)ngs2_system_destroy;
++    return 0;
++}
++void runtime_ngs2_report(void) {
++    printf("Runtime: ngs2 systems=%zu racks=%zu voices=%zu control=%zu renders=%zu grains=%zu "
++           "waveforms=%zu render errors=%zu",
++           systems_created, racks_created, voices_created, control_calls, render_calls, grains,
++           waveform_calls, render_errors);
++    if (render_calls)
++        printf(" (last render: %u buffers, %u bytes, type %u, %u channels)", last_render_buffers,
++               last_render_size, last_render_type, last_render_channels);
++    printf("\n");
++}
+diff --git a/src/runtime_platform.c b/src/runtime_platform.c
+new file mode 100644
+index 0000000..6a1d855
+--- /dev/null
++++ b/src/runtime_platform.c
+@@ -0,0 +1,83 @@
++/* The platform subsystems this title initialises at startup that a phone does not have: USB mass
++ * storage, the screenshot / video-recording flags, SharePlay, live streaming. Every one of them is a
++ * setting or a query with no device behind it, so each call is accepted and nothing is reported -
++ * which is what the hardware library answers when there is no USB device, no share target and no
++ * streaming service. The functions keep their own names in the report so a log shows which
++ * subsystems the game actually touches; a call that needs an output buffer is not accepted here and
++ * stays unimplemented (the runtime lists it at startup, see probe.c).
++ *
++ * The fourteen imports CUSA02716 makes of these libraries before its main loop: analysis.json
++ * indexes 288, 289, 290, 291, 292, 293, 627, 628, 629, 630 (and the dialog libraries, which are
++ * left out on purpose: an unanswered dialog would block a caller that waits for FINISHED). */
++#define _GNU_SOURCE
++#include "runtime.h"
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++
++#define MAX_NOTED 16
++static pthread_mutex_t note_lock = PTHREAD_MUTEX_INITIALIZER;
++static size_t stub_calls;
++static const char *stub_names[MAX_NOTED];
++
++static void platform_note(const char *name) {
++    pthread_mutex_lock(&note_lock);
++    if (stub_calls < MAX_NOTED) stub_names[stub_calls] = name;
++    stub_calls++;
++    pthread_mutex_unlock(&note_lock);
++}
++
++/* An accepted call with no effect and no out-parameter. Any argument the caller passes is ignored,
++ * so one shape serves the one-argument and the no-argument entry points alike. */
++#define PLATFORM_ACCEPT(name)                                              \
++    static ABI int32_t name(uintptr_t argument0, uintptr_t argument1) {    \
++        (void)argument0;                                                   \
++        (void)argument1;                                                   \
++        platform_note(#name);                                              \
++        return 0;                                                          \
++    }
++
++PLATFORM_ACCEPT(usb_storage_init)          /* sceUsbStorageInit(const SceUsbStorageParam*) */
++PLATFORM_ACCEPT(usb_storage_term)          /* sceUsbStorageTerm(void) */
++PLATFORM_ACCEPT(usb_storage_register)      /* sceUsbStorageRegisterCallback(callback) */
++PLATFORM_ACCEPT(usb_storage_unregister)    /* sceUsbStorageUnregisterCallback(void) */
++PLATFORM_ACCEPT(screen_shot_enable)        /* sceScreenShotEnable(void) */
++PLATFORM_ACCEPT(screen_shot_disable)       /* sceScreenShotDisable(void) */
++PLATFORM_ACCEPT(video_recording_info)      /* sceVideoRecordingSetInfo(const SceVideoRecordingInfo*) */
++PLATFORM_ACCEPT(share_play_init)           /* sceSharePlayInitialize(void) */
++PLATFORM_ACCEPT(share_play_prohibition)    /* sceSharePlaySetProhibition(int) */
++PLATFORM_ACCEPT(live_streaming_init)       /* sceGameLiveStreamingInitialize(void) */
++PLATFORM_ACCEPT(live_streaming_enable)     /* sceGameLiveStreamingEnableLiveStreaming(int) */
++
++uintptr_t runtime_platform_resolve(const char *name) {
++    /* The names are the PS4 ones: import_names.inc was generated from another title and has no entry
++     * for these NIDs, so the binding is by NID (runtime_key_match compares the eleven NID
++     * characters only, whatever `#library#module` suffix this image spells). */
++    if (runtime_key_match(name, "BDDZwF5kuTc#")) return (uintptr_t)usb_storage_init;
++    if (runtime_key_match(name, "Wp8zHTocS5E#")) return (uintptr_t)usb_storage_term;
++    if (runtime_key_match(name, "vFkdkzJgSpw#")) return (uintptr_t)usb_storage_register;
++    if (runtime_key_match(name, "+Ib-MHNUf80#")) return (uintptr_t)usb_storage_unregister;
++    if (runtime_key_match(name, "2xxUtuC-RzE#")) return (uintptr_t)screen_shot_enable;
++    if (runtime_key_match(name, "tIYf0W5VTi8#")) return (uintptr_t)screen_shot_disable;
++    if (runtime_key_match(name, "Fc8qxlKINYQ#")) return (uintptr_t)video_recording_info;
++    if (runtime_key_match(name, "isruqthpYcw#")) return (uintptr_t)share_play_init;
++    if (runtime_key_match(name, "co2NCj--pnc#")) return (uintptr_t)share_play_prohibition;
++    if (runtime_key_match(name, "kvYEw2lBndk#")) return (uintptr_t)live_streaming_init;
++    if (runtime_key_match(name, "dWM80AX39o4#")) return (uintptr_t)live_streaming_enable;
++    return 0;
++}
++void runtime_platform_report(void) {
++    pthread_mutex_lock(&note_lock);
++    const size_t calls = stub_calls;
++    pthread_mutex_unlock(&note_lock);
++    if (!calls) {
++        printf("Runtime: platform stubs not called\n");
++        return;
++    }
++    printf("Runtime: platform stubs accepted %zu calls", calls);
++    for (size_t i = 0; i < MAX_NOTED; ++i) {
++        if (!stub_names[i]) break;
++        printf("%s%s", i ? ", " : " (", stub_names[i]);
++    }
++    printf(")\n");
++}
