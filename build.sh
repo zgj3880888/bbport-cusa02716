@@ -102,9 +102,20 @@ step_bionic() {
         log "Boost headers linked: $prefix/include/boost -> /usr/include/boost"
     fi
 
-    # Boost 1.83 的 asio 在 NDK libc++ + C++23 下缺 <exception> 的间接包含；这条修复放在
-    # gpu/CMakeLists.txt 里（add_compile_options + COMPILE_LANGUAGE:CXX 生成式），
-    # 因为环境变量 CXXFLAGS 并不会被这里的 cmake 调用采纳。
+    # boost 的 asio 修复已移到 gpu/CMakeLists.txt（target_compile_options），环境变量在这里不生效。
+
+    # ps4-pkg-tool：build_bionic.sh 的最后一步要它（app 的 PKG 安装器会调用），但它不在上游树里，
+    # 源头是外部仓库 xXJSONDeruloXx/ps4-pkg-tools @ 45baeda，且 externals/cryptopp 是 submodule。
+    local pkgtool=$PWD/.local-deps/src/ps4-pkg-tools
+    if [[ ! -f $pkgtool/externals/cryptopp/cryptlib.h ]]; then
+        rm -rf "$pkgtool"
+        mkdir -p "$(dirname "$pkgtool")"
+        git clone --filter=blob:none https://github.com/xXJSONDeruloXx/ps4-pkg-tools "$pkgtool"
+        git -C "$pkgtool" checkout -q 45baedaa29b8da42b3c6fe912800d2fa4119834b
+        git -C "$pkgtool" submodule update --init --recursive
+        log "ps4-pkg-tools ready at $pkgtool"
+    fi
+    export BB_PKG_TOOL_SRC=$pkgtool
 
     bash tools/android/build_bionic.sh
 }
