@@ -2006,3 +2006,21 @@ index 448d0e2..0bfe821 100755
      fi
      # The GX per-frame command heaps at 1 MiB (upstream #162; BB_GX_COMMAND_HEAP=0: the game's 256 KiB).
      [ "${BB_GX_COMMAND_HEAP:-1}" != 0 ] && [ -f "$parts/gx-heap.bin" ] &&
+diff --git a/tools/android/frontend/src/ro/cobrabm/fexdroid/NativeCpu.java b/tools/android/frontend/src/ro/cobrabm/fexdroid/NativeCpu.java
+--- a/tools/android/frontend/src/ro/cobrabm/fexdroid/NativeCpu.java
++++ b/tools/android/frontend/src/ro/cobrabm/fexdroid/NativeCpu.java
+@@ -163,8 +163,12 @@
+                 + "; this phone has image " + imageHash + (gameId != null ? ", " + describe(gameId, gameVersion) : "")
+                 + "). Build it from the same game folder the app uses, with the 1.09 update merged in.";
+         }
+-        if (info.gameId != null && !GameCheck.SUPPORTED_TITLES.contains(info.gameId))
+-            return "It was built from " + info.gameId + ", which is not a Bloodborne game folder the app supports.";
++        // bbport: this build also runs titles outside Bloodborne's whitelist (the prepared side skips
++        // game_check with BB_SKIP_GAME_CHECK=1). Before the game has been prepared there is no image on the
++        // phone to compare, and refusing on the title alone would make such a library impossible to import at
++        // all. The image hash stays the real guard: it is compared as soon as data/boot-linked.bin exists
++        // (startState() computes it), and a library built from another build is still rejected there.
++        if (info.gameId != null && !GameCheck.SUPPORTED_TITLES.contains(info.gameId)) return null;
+         if (info.gameVersion != null && !GameCheck.SUPPORTED_VERSION.equals(info.gameVersion))
+             return "It was built from game version " + info.gameVersion + "; the app runs version " + GameCheck.SUPPORTED_VERSION + ".";
+         if (gameVersion != null && info.gameVersion != null && !gameVersion.equals(info.gameVersion))
