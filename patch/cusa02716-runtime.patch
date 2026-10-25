@@ -2879,3 +2879,47 @@ index 0000000..6a1d855
 +    }
 +    printf(")\n");
 +}
+diff --git a/src/probe.c b/src/probe.c
+index 47f2b6e..56b0ec4 100644
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -949,6 +949,10 @@
+         t[8] = 0x48; t[9] = 0xb8; memcpy(t + 10, &handler, 8);
+         t[18] = 0xff; t[19] = 0xe0;
+     }
++    /* bbport: every import left on a trap, collected while the relocations are applied. Without this
++     * the game reports only the first one it happens to call, so each missing import costs another
++     * build; with it one startup log lists the whole HLE gap. */
++    unsigned char *missing = calloc(import_count ? import_count : 1, 1);
+     for (uint64_t i = 0; i < nr; ++i) {
+         uintptr_t value = relocs[i].kind == 2 ? (uintptr_t)(data_traps + page_size * relocs[i].value + relocs[i].addend)
+                         : relocs[i].kind == 1 ? (uintptr_t)(traps + 32 * relocs[i].value)
+@@ -962,9 +966,28 @@
+                 if (binding_kinds[relocs[i].value]!=relocs[i].kind || !mapped(segments,ns,address,relocs[i].addend+1)) fail("native export kind/range mismatch");
+                 value=(uintptr_t)image+address+relocs[i].addend;
+             }
++            else missing[relocs[i].value] = 1; /* no implementation: the slot keeps its trap */
+         }
+         memcpy(image + relocs[i].target, &value, 8);
+     }
++    {
++        uint64_t count = 0;
++        for (uint64_t i = 0; i < import_count; ++i)
++            if (missing[i]) count++;
++        if (!count) printf("Imports: all %" PRIu64 " have an implementation\n", import_count);
++        else {
++            printf("Imports: %" PRIu64 " of %" PRIu64 " have no implementation; the first one the game "
++                   "calls stops it:\n", count, import_count);
++            for (uint64_t i = 0; i < import_count; ++i) {
++                const char *symbol;
++                if (!missing[i]) continue;
++                symbol = runtime_import_name(names[i]);
++                printf("Imports:   %4" PRIu64 " %s %s\n", i, names[i],
++                       strncmp(symbol, "name not resolved", 17) ? symbol : "(no name)");
++            }
++        }
++        free(missing);
++    }
+     runtime_net_image_mapped(image, size); /* online modules that read the original code */
+     for (int i=0;i<patch_count;++i) apply_patches(patch_files[i], segments, ns, relocs, nr);
+     if (!cpu_only) {
