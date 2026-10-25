@@ -1916,7 +1916,7 @@ index 9875a3d..4e7081c 100644
          os.replace(work / 'boot-linked.bin', data / 'boot-linked.bin')
          os.replace(work / 'content.bin', data / 'content.bin')
 diff --git a/tools/android/run-bionic.sh b/tools/android/run-bionic.sh
-index 448d0e2..72b1895 100755
+index 448d0e2..0bfe821 100755
 --- a/tools/android/run-bionic.sh
 +++ b/tools/android/run-bionic.sh
 @@ -111,6 +111,14 @@ if [ "$render" = 1920x1080 ]; then render=; preset=0; fi
@@ -1934,7 +1934,21 @@ index 448d0e2..72b1895 100755
  export BB_FULLSCREEN=1 BB_UPSCALER=$upscaler BB_UPSCALE_PRESET=$preset
  # FSR 3.1 frame generation (frame_generation=1): a frame between each two, with FSR 3.1 only.
  [ "$(setting frame_generation)" = 1 ] && [ "$upscaler" = fsr3 ] && export BB_FRAME_GEN=1
-@@ -415,27 +423,42 @@ if [ "${1:-game}" = game ]; then
+@@ -407,6 +415,13 @@ cd "$base"
+ if [ "${1:-game}" = game ]; then
+     game_dir=${BB_GAME_DIR:-$base/game}
+     [ -f "$game_dir/eboot.bin" ] || { echo "Game missing: $game_dir"; exit 2; }
++    # bbport: this build targets CUSA02716 (Kamen Rider: Battride War Genesis), not Bloodborne.
++    # tools/android/prepare/game_check.cpp only accepts the nine Bloodborne 1.09 titles and would stop
++    # every start with "This is not a retail release of Bloodborne", so the check is turned off with the
++    # same switch scripts/prepare.py documents. Nothing else depends on it: the native library is not
++    # tied to a title, libbbaot.json records the game image hash and the app compares that.
++    export BB_SKIP_GAME_CHECK=1
++    echo "Game check: off (BB_SKIP_GAME_CHECK=1): this port runs CUSA02716, the check only knows Bloodborne"
+     "$bionic/bin/bb-prepare" "$game_dir" "$base/data"
+     mods_dir=$(setting mods_dir)
+     [ -n "$mods_dir" ] || mods_dir=/storage/emulated/0/Bloodborne/mods
+@@ -415,27 +430,42 @@ if [ "${1:-game}" = game ]; then
      app0_dir=${BB_APP0_DIR:-$game_dir}
      # The settings' pre-compiled patches (build_patch_parts.py) as the words of $patch_args (none of the
      # paths has a space).
