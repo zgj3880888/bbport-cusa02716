@@ -1775,6 +1775,25 @@ index 4a9627e..6a57c0a 100755
  flags=(-std=c++17 -O2 -g -Wall -Wextra -Werror -Wno-unused-parameter)
  
  # build OUT CXX LINK_ARGS...: one object per source file, built in parallel, then linked.
+diff --git a/tools/android/build_release_apk.sh b/tools/android/build_release_apk.sh
+index afc385a..0ffd0fe 100644
+--- a/tools/android/build_release_apk.sh
++++ b/tools/android/build_release_apk.sh
+@@ -15,8 +15,12 @@ if [[ ${BB_TEST_BUILD:-0} == 1 ]]; then
+ fi
+ apk=out/release/${BB_APK_NAME:-Bloodborne-$version}.apk
+ # The three GPU drivers the app carries (build_frontend.sh puts them in the APK): downloaded and checked here so a
+-# release build never goes without them.
+-bash tools/android/fetch_bundled_drivers.sh
++# release build never goes without them. bbport: BB_SKIP_DRIVERS=1 builds without them on purpose (the phone's own
++# Vulkan driver is used instead, which is what an Adreno 750 device wants); build_frontend.sh honours the same switch,
++# so the only thing skipped here is the download.
++if [[ ${BB_SKIP_DRIVERS:-0} != 1 ]]; then
++    bash tools/android/fetch_bundled_drivers.sh
++fi
+ python3 tools/android/build_release_runtime.py
+ BB_RUNTIME_ARCHIVE="$PWD/out/release/runtime.tar.gz" bash tools/android/build_frontend.sh
+ cp out/thor/frontend/Bloodborne-Thor.apk "$apk"
 diff --git a/tools/android/build_turnip_android.sh b/tools/android/build_turnip_android.sh
 index 7a6d457..c5addf3 100755
 --- a/tools/android/build_turnip_android.sh
