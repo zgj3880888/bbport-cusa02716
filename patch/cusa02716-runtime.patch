@@ -478,10 +478,10 @@ index 0000000..3a9c379
 +} // namespace Libraries::Kernel
 diff --git a/gpu/shadps4/core/libraries/zlib/sce_zlib.cpp b/gpu/shadps4/core/libraries/zlib/sce_zlib.cpp
 new file mode 100644
-index 0000000..d3ef675
+index 0000000..5bd3124
 --- /dev/null
 +++ b/gpu/shadps4/core/libraries/zlib/sce_zlib.cpp
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,228 @@
 +// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +// bbport: ported from shadPS4 src/core/libraries/zlib/zlib.cpp.
@@ -509,6 +509,7 @@ index 0000000..d3ef675
 +#include "common/logging/log.h"
 +#include "common/thread.h"
 +#include "common/types.h"
++#include "core/libraries/error_codes.h"
 +#include "core/libraries/libs.h"
 +#include "core/libraries/zlib/sce_zlib.h"
 +

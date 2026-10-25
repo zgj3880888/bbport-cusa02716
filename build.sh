@@ -102,6 +102,12 @@ step_bionic() {
         log "Boost headers linked: $prefix/include/boost -> /usr/include/boost"
     fi
 
+    # Boost 1.83 的 asio/execution/detail/as_receiver.hpp 直接用了 std::terminate 却没包含
+    # <exception>；GCC 会间接带进来，NDK r29 的 libc++ 在 C++23 下不带，于是报
+    # "no member named 'terminate' in namespace 'std'"。给每个 C++ TU 预包含一次即可。
+    # 只作用于 C++（C 文件读的是 CFLAGS），对 NDK 自带的头没有副作用。
+    export CXXFLAGS="-include exception ${CXXFLAGS:-}"
+
     bash tools/android/build_bionic.sh
 }
 
