@@ -842,7 +842,7 @@ index 0de63f0..a46d5b1 100644
          image_hash = image_hash or image_sha256(game)
          if image_hash == SUPPORTED_IMAGE:
 diff --git a/src/runtime.c b/src/runtime.c
-index d0fae6f..4c76565 100644
+index d0fae6f..37b4766 100644
 --- a/src/runtime.c
 +++ b/src/runtime.c
 @@ -9,6 +9,7 @@
@@ -853,16 +853,17 @@ index d0fae6f..4c76565 100644
  
  typedef struct {
      union { GuestCallback plain; void (ABI *with_arg)(void *); } callback;
-@@ -96,6 +97,8 @@
+@@ -96,6 +97,9 @@
      runtime_memory_report();
      runtime_ajm_report();
      runtime_audio_report();
++    runtime_dialogs_report();
 +    runtime_ngs2_report();
 +    runtime_platform_report();
      runtime_pad_report();
      runtime_savedata_report();
      runtime_file_report();
-@@ -199,6 +202,46 @@
+@@ -199,6 +203,46 @@
      atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcmp(a, b, size);
  }
  static ABI size_t guest_strlen(const char *text) { return strlen(text); }
@@ -909,7 +910,7 @@ index d0fae6f..4c76565 100644
  static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
      printf("Runtime: guest requested exit(%d)\n", status);
      runtime_finalize(NULL);
-@@ -209,29 +252,33 @@
+@@ -209,29 +253,33 @@
      if (!(capabilities & 1)) return 0;
      if (is_data) {
          static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
@@ -962,10 +963,12 @@ index d0fae6f..4c76565 100644
      uintptr_t mutex = runtime_mutex_resolve(name);
      if (mutex) return mutex;
      uintptr_t thread = runtime_thread_resolve(name);
-@@ -254,6 +301,10 @@
+@@ -254,6 +302,12 @@
      if (ajm) return ajm;
      uintptr_t audio = runtime_audio_resolve(name);
      if (audio) return audio;
++    uintptr_t dialog = runtime_dialogs_resolve(name);
++    if (dialog) return dialog;
 +    uintptr_t ngs2 = runtime_ngs2_resolve(name);
 +    if (ngs2) return ngs2;
 +    uintptr_t platform = runtime_platform_resolve(name);
@@ -973,7 +976,7 @@ index d0fae6f..4c76565 100644
      uintptr_t pad = runtime_pad_resolve(name);
      if (pad) return pad;
      uintptr_t rtc = runtime_rtc_resolve(name);
-@@ -267,10 +318,32 @@
+@@ -267,10 +321,32 @@
  static const struct { const char *nid, *symbol; } import_names[]={
  #include "import_names.inc"
  };
@@ -1008,7 +1011,7 @@ index d0fae6f..4c76565 100644
  }
  /* Same symbol name means same contract whether imported from libkernel or
 diff --git a/src/runtime.h b/src/runtime.h
-index b0a3b16..d0ae198 100644
+index b0a3b16..e0adac9 100644
 --- a/src/runtime.h
 +++ b/src/runtime.h
 @@ -178,6 +178,7 @@
@@ -1019,10 +1022,12 @@ index b0a3b16..d0ae198 100644
  uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *nid);
  uintptr_t runtime_kernel_resolve(const char *name);
  uintptr_t runtime_file_resolve(const char *name);
-@@ -227,6 +228,10 @@
+@@ -227,6 +228,12 @@
  void runtime_ajm_report(void);
  uintptr_t runtime_audio_resolve(const char *name);
  void runtime_audio_report(void);
++uintptr_t runtime_dialogs_resolve(const char *name);
++void runtime_dialogs_report(void);
 +uintptr_t runtime_ngs2_resolve(const char *name);
 +void runtime_ngs2_report(void);
 +uintptr_t runtime_platform_resolve(const char *name);
@@ -2923,3 +2928,205 @@ index 47f2b6e..56b0ec4 100644
      runtime_net_image_mapped(image, size); /* online modules that read the original code */
      for (int i=0;i<patch_count;++i) apply_patches(patch_files[i], segments, ns, relocs, nr);
      if (!cpu_only) {
+diff --git a/src/runtime_dialogs.c b/src/runtime_dialogs.c
+new file mode 100644
+index 0000000..ea60353
+--- /dev/null
++++ b/src/runtime_dialogs.c
+@@ -0,0 +1,196 @@
++/* The on-screen dialogs and the on-screen keyboard: the thirty imports CUSA02716 makes of
++ * libSceIme, libSceErrorDialog, libSceMsgDialog, libSceSaveDataDialog, libSceSigninDialog and
++ * libSceInvitationDialog.
++ *
++ * There is no dialog to show on a phone and nobody to answer one, so every dialog is reported as
++ * having finished the moment it is opened: UpdateStatus answers FINISHED (3), GetResult hands back
++ * a zeroed result (CommonDialog::Result::OK) and IsReadyToDisplay answers 1. A caller that opens a
++ * dialog and then polls for FINISHED goes on at once instead of waiting for an answer that would
++ * never come. That is also the answer the hardware library gives when the dialog is dismissed
++ * without a choice, which is why these entry points can share one shape.
++ *
++ * The result structures are zeroed to the size the PS4 SDK gives them (OrbisMsgDialogResult 16,
++ * OrbisSaveDataDialogResult 72, OrbisSigninDialogResult 16, OrbisInvitationDialogResult 56,
++ * OrbisImeKeyboardResourceIdArray 24, OrbisImeKeyboardInfo 32) - never more, so a caller's
++ * neighbouring bytes are untouched.
++ *
++ * The IME is treated the same way: the keyboard opens and reports no input. sceImeUpdate hands the
++ * game no event, so whatever polls it sees an idle keyboard rather than one that never answers. */
++#define _GNU_SOURCE
++#include "runtime.h"
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++/* CommonDialog::Status (system/commondialog.h): the value UpdateStatus and GetStatus return. */
++enum { DIALOG_NONE = 0, DIALOG_INITIALIZED = 1, DIALOG_RUNNING = 2, DIALOG_FINISHED = 3 };
++
++static pthread_mutex_t dialog_lock = PTHREAD_MUTEX_INITIALIZER;
++
++#define DIALOG_STATE(_cname) static int _cname##_state
++
++DIALOG_STATE(error);
++DIALOG_STATE(message);
++DIALOG_STATE(save_data);
++DIALOG_STATE(signin);
++DIALOG_STATE(invitation);
++static int keyboard_open;
++
++/* An entry point with no out-parameter: it succeeds and leaves the dialog finished. */
++#define DIALOG_ACCEPT(_cname, _name)                                       \
++    static ABI int32_t _name(uintptr_t argument0, uintptr_t argument1) {    \
++        (void)argument0;                                                   \
++        (void)argument1;                                                   \
++        pthread_mutex_lock(&dialog_lock);                                   \
++        _cname##_state = DIALOG_FINISHED;                                   \
++        pthread_mutex_unlock(&dialog_lock);                                 \
++        return 0;                                                           \
++    }
++
++/* The same, but it does not start a dialog: a close or a terminate. */
++#define DIALOG_PLAIN(_name)                                                \
++    static ABI int32_t _name(uintptr_t argument0, uintptr_t argument1) {    \
++        (void)argument0;                                                    \
++        (void)argument1;                                                    \
++        return 0;                                                           \
++    }
++
++/* UpdateStatus / GetStatus: what the caller polls after opening the dialog. */
++#define DIALOG_STATUS(_cname, _name)                                       \
++    static ABI int32_t _name(void) {                                        \
++        int32_t status;                                                     \
++        pthread_mutex_lock(&dialog_lock);                                   \
++        status = _cname##_state;                                            \
++        pthread_mutex_unlock(&dialog_lock);                                 \
++        return status;                                                      \
++    }
++
++/* GetResult: a zeroed result of `size` bytes, which is CommonDialog::Result::OK. */
++#define DIALOG_RESULT(_name, _size)                                        \
++    static ABI int32_t _name(void *result) {                                \
++        if (result) memset(result, 0, (_size));                             \
++        return 0;                                                           \
++    }
++
++/* libSceErrorDialog -------------------------------------------------------------------------- */
++DIALOG_ACCEPT(error, error_dialog_initialize)   /* sceErrorDialogInitialize(void) */
++DIALOG_ACCEPT(error, error_dialog_open)         /* sceErrorDialogOpen(const OrbisErrorDialogParam*) */
++DIALOG_PLAIN(error_dialog_close)                /* sceErrorDialogClose(void) */
++DIALOG_STATUS(error, error_dialog_update_status) /* sceErrorDialogUpdateStatus(void) */
++DIALOG_PLAIN(error_dialog_terminate)            /* sceErrorDialogTerminate(void) */
++
++/* libSceMsgDialog ---------------------------------------------------------------------------- */
++DIALOG_PLAIN(msg_dialog_progress_inc)       /* sceMsgDialogProgressBarInc(target, delta) */
++DIALOG_PLAIN(msg_dialog_progress_set_value) /* sceMsgDialogProgressBarSetValue(target, rate) */
++DIALOG_PLAIN(msg_dialog_progress_set_msg)   /* sceMsgDialogProgressBarSetMsg(target, const char*) */
++DIALOG_PLAIN(msg_dialog_close)              /* sceMsgDialogClose(void) */
++DIALOG_RESULT(msg_dialog_get_result, 16)    /* sceMsgDialogGetResult(OrbisMsgDialogResult*) */
++
++/* libSceSaveDataDialog ---------------------------------------------------------------------- */
++DIALOG_STATUS(save_data, save_data_dialog_get_status) /* sceSaveDataDialogGetStatus(void) */
++DIALOG_RESULT(save_data_dialog_get_result, 72)        /* sceSaveDataDialogGetResult(..Result*) */
++DIALOG_PLAIN(save_data_dialog_close)                  /* sceSaveDataDialogClose(void) */
++/* 1: the dialog can be drawn. Without a dialog to draw, answering 0 would leave a caller that
++ * waits for the display spinning. */
++static ABI int32_t save_data_dialog_is_ready_to_display(void) { return 1; }
++
++/* libSceSigninDialog ------------------------------------------------------------------------ */
++DIALOG_ACCEPT(signin, signin_dialog_initialize) /* sceSigninDialogInitialize(void) */
++DIALOG_ACCEPT(signin, signin_dialog_open)       /* sceSigninDialogOpen(const OrbisSigninDialogParam*) */
++DIALOG_PLAIN(signin_dialog_terminate)           /* sceSigninDialogTerminate(void) */
++DIALOG_STATUS(signin, signin_dialog_update_status) /* sceSigninDialogUpdateStatus(void) */
++DIALOG_RESULT(signin_dialog_get_result, 16)     /* sceSigninDialogGetResult(OrbisSigninDialogResult*) */
++DIALOG_PLAIN(signin_dialog_close)               /* sceSigninDialogClose(void) */
++
++/* libSceInvitationDialog -------------------------------------------------------------------- */
++DIALOG_ACCEPT(invitation, invitation_dialog_initialize) /* sceInvitationDialogInitialize(void) */
++DIALOG_ACCEPT(invitation, invitation_dialog_open)       /* sceInvitationDialogOpen(const ..Param*) */
++DIALOG_PLAIN(invitation_dialog_terminate)               /* sceInvitationDialogTerminate(void) */
++DIALOG_STATUS(invitation, invitation_dialog_update_status) /* sceInvitationDialogUpdateStatus(void) */
++DIALOG_RESULT(invitation_dialog_get_result, 56) /* sceInvitationDialogGetResult(..Result*) */
++
++/* libSceIme --------------------------------------------------------------------------------- */
++static ABI int32_t ime_keyboard_open(uintptr_t user_id, uintptr_t param) {
++    (void)user_id;
++    (void)param;
++    pthread_mutex_lock(&dialog_lock);
++    keyboard_open = 1;
++    pthread_mutex_unlock(&dialog_lock);
++    return 0;
++}
++static ABI int32_t ime_keyboard_close(uintptr_t user_id, uintptr_t argument1) {
++    (void)user_id;
++    (void)argument1;
++    pthread_mutex_lock(&dialog_lock);
++    keyboard_open = 0;
++    pthread_mutex_unlock(&dialog_lock);
++    return 0;
++}
++/* No event to hand the game: an idle keyboard, not one that never answers. */
++static ABI int32_t ime_update(uintptr_t handler, uintptr_t argument1) {
++    (void)handler;
++    (void)argument1;
++    return 0;
++}
++/* OrbisImeKeyboardResourceIdArray is 24 bytes: user_id then five resource ids. */
++static ABI int32_t ime_keyboard_get_resource_id(uintptr_t user_id, void *array) {
++    (void)user_id;
++    if (array) memset(array, 0, 24);
++    return 0;
++}
++/* OrbisImeKeyboardInfo is 32 bytes. */
++static ABI int32_t ime_keyboard_get_info(uintptr_t resource_id, void *info) {
++    (void)resource_id;
++    if (info) memset(info, 0, 32);
++    return 0;
++}
++
++uintptr_t runtime_dialogs_resolve(const char *name) {
++    /* Bound by NID: import_names.inc was generated from another title and has no entry for these,
++     * and runtime_key_match compares the eleven NID characters only, so the `#library#module`
++     * suffix this image spells does not matter. */
++    if (runtime_key_match(name, "I88KChlynSs#")) return (uintptr_t)error_dialog_initialize;
++    if (runtime_key_match(name, "M2ZF-ClLhgY#")) return (uintptr_t)error_dialog_open;
++    if (runtime_key_match(name, "ekXHb1kDBl0#")) return (uintptr_t)error_dialog_close;
++    if (runtime_key_match(name, "WWiGuh9XfgQ#")) return (uintptr_t)error_dialog_update_status;
++    if (runtime_key_match(name, "9XAxK2PMwk8#")) return (uintptr_t)error_dialog_terminate;
++
++    if (runtime_key_match(name, "Gc5k1qcK4fs#")) return (uintptr_t)msg_dialog_progress_inc;
++    if (runtime_key_match(name, "wTpfglkmv34#")) return (uintptr_t)msg_dialog_progress_set_value;
++    if (runtime_key_match(name, "6H-71OdrpXM#")) return (uintptr_t)msg_dialog_progress_set_msg;
++    if (runtime_key_match(name, "HTrcDKlFKuM#")) return (uintptr_t)msg_dialog_close;
++    if (runtime_key_match(name, "Lr8ovHH9l6A#")) return (uintptr_t)msg_dialog_get_result;
++
++    if (runtime_key_match(name, "ERKzksauAJA#")) return (uintptr_t)save_data_dialog_get_status;
++    if (runtime_key_match(name, "yEiJ-qqr6Cg#")) return (uintptr_t)save_data_dialog_get_result;
++    if (runtime_key_match(name, "fH46Lag88XY#")) return (uintptr_t)save_data_dialog_close;
++    if (runtime_key_match(name, "en7gNVnh878#")) return (uintptr_t)save_data_dialog_is_ready_to_display;
++
++    if (runtime_key_match(name, "mlYGfmqE3fQ#")) return (uintptr_t)signin_dialog_initialize;
++    if (runtime_key_match(name, "JlpJVoRWv7U#")) return (uintptr_t)signin_dialog_open;
++    if (runtime_key_match(name, "LXlmS6PvJdU#")) return (uintptr_t)signin_dialog_terminate;
++    if (runtime_key_match(name, "Bw31liTFT3A#")) return (uintptr_t)signin_dialog_update_status;
++    if (runtime_key_match(name, "nqG7rqnYw1U#")) return (uintptr_t)signin_dialog_get_result;
++    if (runtime_key_match(name, "M3OkENHcyiU#")) return (uintptr_t)signin_dialog_close;
++
++    if (runtime_key_match(name, "XvA5KS56wcs#")) return (uintptr_t)invitation_dialog_initialize;
++    if (runtime_key_match(name, "0zU0G+wiVLA#")) return (uintptr_t)invitation_dialog_open;
++    if (runtime_key_match(name, "B6HVJtDYxEE#")) return (uintptr_t)invitation_dialog_terminate;
++    if (runtime_key_match(name, "9+g9iOq+7kg#")) return (uintptr_t)invitation_dialog_update_status;
++    if (runtime_key_match(name, "8XKR6wa64iQ#")) return (uintptr_t)invitation_dialog_get_result;
++
++    if (runtime_key_match(name, "eaFXjfJv3xs#")) return (uintptr_t)ime_keyboard_open;
++    if (runtime_key_match(name, "PMVehSlfZ94#")) return (uintptr_t)ime_keyboard_close;
++    if (runtime_key_match(name, "-4GCfYdNF1s#")) return (uintptr_t)ime_update;
++    if (runtime_key_match(name, "dKadqZFgKKQ#")) return (uintptr_t)ime_keyboard_get_resource_id;
++    if (runtime_key_match(name, "VkqLPArfFdc#")) return (uintptr_t)ime_keyboard_get_info;
++    return 0;
++}
++
++void runtime_dialogs_report(void) {
++    printf("Runtime: dialogs: error=%d message=%d savedata=%d signin=%d invitation=%d"
++           " keyboard open=%d\n",
++           error_state, message_state, save_data_state, signin_state, invitation_state,
++           keyboard_open);
++}
