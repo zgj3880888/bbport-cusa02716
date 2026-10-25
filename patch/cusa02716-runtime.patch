@@ -1732,7 +1732,7 @@ index 1807eb7..586190c 100644
      Image.open(icon).save(out/'res/drawable/icon.png')
  PY
 diff --git a/tools/android/build_pkg_tool.sh b/tools/android/build_pkg_tool.sh
-index 2fd7296..74b62e6 100755
+index 2fd7296..1a92bc8 100755
 --- a/tools/android/build_pkg_tool.sh
 +++ b/tools/android/build_pkg_tool.sh
 @@ -16,7 +16,7 @@ cd -- "$(dirname -- "$0")/../.."
@@ -1744,6 +1744,24 @@ index 2fd7296..74b62e6 100755
  src=${BB_PKG_TOOL_SRC:-}
  if [[ -z $src ]]; then
      common=$(cd -- "$(git rev-parse --git-common-dir)/.." && pwd)
+@@ -35,7 +35,16 @@ for entry in "$src"/*; do
+ done
+ cp -a "$src/src" "$copy/src"
+ for patch in "$root"/tools/android/pkg-tool-patches/*.patch; do
+-    patch -d "$copy" -p1 -s < "$patch" || { echo "Patch failed: $patch" >&2; exit 1; }
++    # bbport: the patches are written against the author's local copy of ps4-pkg-tools (its pkg.cpp
++    # starts with #include </usr/include/zlib.h>), while the pinned upstream commit has
++    # #include "zlib/zlib.h", so some hunks do not match. Dry-run first: either every hunk applies
++    # or the patch is skipped as a whole. Applying half of it would leave the source inconsistent,
++    # and skipping costs only the byte-progress / 64-bit-offset extras, not the build itself.
++    if patch -d "$copy" -p1 -s --dry-run < "$patch" 2>/dev/null; then
++        patch -d "$copy" -p1 -s < "$patch"
++    else
++        echo "Note: pkg-tool patch not applicable to this source, skipped: ${patch##*/}" >&2
++    fi
+ done
+ src=$copy
+ # The tool prints "Progress: N / M files" with plain "\n": linked into a pipe, stdout would be
 diff --git a/tools/android/build_prepare.sh b/tools/android/build_prepare.sh
 index 4a9627e..6a57c0a 100755
 --- a/tools/android/build_prepare.sh
