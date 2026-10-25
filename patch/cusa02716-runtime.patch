@@ -1,0 +1,1802 @@
+diff --git a/gpu/CMakeLists.txt b/gpu/CMakeLists.txt
+index 012ee43..2d159d0 100644
+--- a/gpu/CMakeLists.txt
++++ b/gpu/CMakeLists.txt
+@@ -166,7 +166,9 @@ file(GLOB CP_SOURCES CONFIGURE_DEPENDS cp/*.cpp)
+ add_library(bbgpu SHARED ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES} ${LAYER_SOURCES} ${GAME_SOURCES} ${CP_SOURCES}
+     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
+     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
+-    shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
++    shadps4/core/libraries/kernel/equeue.cpp shadps4/core/libraries/kernel/eventflag.cpp
++    shadps4/core/libraries/zlib/sce_zlib.cpp
++    ${AVPLAYER}
+     shadps4/core/libraries/videodec/video_utils.cpp)
+ add_dependencies(bbgpu host_shaders)
+ # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
+diff --git a/gpu/shadps4/core/libraries/kernel/eventflag.cpp b/gpu/shadps4/core/libraries/kernel/eventflag.cpp
+new file mode 100644
+index 0000000..9323a9d
+--- /dev/null
++++ b/gpu/shadps4/core/libraries/kernel/eventflag.cpp
+@@ -0,0 +1,433 @@
++// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport: ported from shadPS4 src/core/libraries/kernel/threads/event_flag.cpp.
++//
++// Differences from upstream, all of them deliberate:
++//  * no pthread.h: the waiter priority is host-thread constant here, because this fork has no
++//    guest scheduler and every guest thread runs at the same host priority. ThreadPrio queue
++//    mode therefore degenerates to FIFO, which is what the attribute is allowed to approximate.
++//  * no UNREACHABLE() on bad arguments: an abort inside an HLE call is a crash the game cannot
++//    recover from, and a title sometimes passes a wait mode wider than the two documented bits.
++//    Unknown values fall back to the documented And/None pair instead.
++//  * sceKernelClearEventFlag clears the bits it is given. Upstream has `m_bits &= bits`, which
++//    keeps exactly those bits and drops every other one -- the opposite. See Clear() below.
++
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstring>
++#include <list>
++#include <mutex>
++#include <string>
++
++#include "common/logging/log.h"
++#include "common/types.h"
++#include "core/libraries/kernel/eventflag.h"
++#include "core/libraries/kernel/orbis_error.h"
++#include "core/libraries/libs.h"
++
++namespace Libraries::Kernel {
++
++namespace {
++
++constexpr int ORBIS_KERNEL_EVF_ATTR_TH_FIFO = 0x01;
++constexpr int ORBIS_KERNEL_EVF_ATTR_TH_PRIO = 0x02;
++constexpr int ORBIS_KERNEL_EVF_ATTR_SINGLE = 0x10;
++constexpr int ORBIS_KERNEL_EVF_ATTR_MULTI = 0x20;
++
++constexpr int ORBIS_KERNEL_EVF_WAITMODE_AND = 0x01;
++constexpr int ORBIS_KERNEL_EVF_WAITMODE_OR = 0x02;
++constexpr int ORBIS_KERNEL_EVF_WAITMODE_CLEAR_ALL = 0x10;
++constexpr int ORBIS_KERNEL_EVF_WAITMODE_CLEAR_PAT = 0x20;
++
++} // namespace
++
++class EventFlagInternal {
++public:
++    enum class ClearMode { None, All, Bits };
++    enum class WaitMode { And, Or };
++    enum class ThreadMode { Single, Multi };
++    enum class QueueMode { Fifo, ThreadPrio };
++
++    struct Waiter {
++        std::condition_variable cv{};
++
++        u64 bits{};
++        WaitMode wait_mode{};
++        ClearMode clear_mode{};
++
++        u64 result = 0;
++
++        bool ready = false;
++        bool canceled = false;
++        bool deleted = false;
++        bool timed_out = false;
++
++        int priority = 0;
++    };
++
++    EventFlagInternal(const std::string& name, ThreadMode thread_mode, QueueMode queue_mode,
++                      u64 bits)
++        : m_name(name), m_thread_mode(thread_mode), m_queue_mode(queue_mode), m_bits(bits) {}
++
++    ~EventFlagInternal() {
++        std::unique_lock lock{m_mutex};
++        m_deleted = true;
++
++        for (auto* w : m_waiters) {
++            w->deleted = true;
++            w->cv.notify_one();
++        }
++
++        m_destroy_cv.wait(lock, [&] { return m_waiters.empty(); });
++    }
++
++    const std::string& GetName() const {
++        return m_name;
++    }
++
++    bool ConditionMet(const Waiter& waiter) const {
++        return (waiter.wait_mode == WaitMode::And) ? (m_bits & waiter.bits) == waiter.bits
++                                                   : (m_bits & waiter.bits) != 0;
++    }
++
++    void ApplyClear(const Waiter& waiter) {
++        switch (waiter.clear_mode) {
++        case ClearMode::None:
++            break;
++        case ClearMode::All:
++            m_bits = 0;
++            break;
++        case ClearMode::Bits:
++            m_bits &= ~waiter.bits;
++            break;
++        }
++    }
++
++    void AddWaiter(Waiter& waiter) {
++        if (m_queue_mode == QueueMode::Fifo) {
++            m_waiters.push_back(&waiter);
++            return;
++        }
++
++        auto it = m_waiters.begin();
++        while (it != m_waiters.end() && (*it)->priority >= waiter.priority) {
++            ++it;
++        }
++        m_waiters.insert(it, &waiter);
++    }
++
++    void RemoveWaiter(Waiter& waiter) {
++        m_waiters.remove(&waiter);
++        if (m_deleted && m_waiters.empty()) {
++            m_destroy_cv.notify_one();
++        }
++    }
++
++    int Wait(u64 bits, WaitMode wait_mode, ClearMode clear_mode, u64* result, u32* ptr_micros) {
++        std::unique_lock lock{m_mutex};
++
++        if (m_deleted) {
++            return ORBIS_KERNEL_ERROR_EACCES;
++        }
++
++        if (m_thread_mode == ThreadMode::Single && !m_waiters.empty()) {
++            return ORBIS_KERNEL_ERROR_EPERM;
++        }
++
++        Waiter waiter{
++            .bits = bits,
++            .wait_mode = wait_mode,
++            .clear_mode = clear_mode,
++            .priority = 0,
++        };
++
++        if (ConditionMet(waiter)) {
++            if (result) {
++                *result = m_bits;
++            }
++            ApplyClear(waiter);
++            return ORBIS_OK;
++        }
++
++        AddWaiter(waiter);
++
++        u32 timeout = 0;
++        const bool infinite = ptr_micros == nullptr;
++        if (!infinite) {
++            timeout = *ptr_micros;
++        }
++
++        auto wake = [&] {
++            return waiter.ready || waiter.canceled || waiter.deleted || waiter.timed_out;
++        };
++
++        if (infinite) {
++            waiter.cv.wait(lock, wake);
++        } else {
++            if (!waiter.cv.wait_for(lock, std::chrono::microseconds(timeout), wake)) {
++                RemoveWaiter(waiter);
++                if (result) {
++                    *result = m_bits;
++                }
++                *ptr_micros = 0;
++                return ORBIS_KERNEL_ERROR_ETIMEDOUT;
++            }
++        }
++
++        RemoveWaiter(waiter);
++
++        if (result) {
++            *result = waiter.result;
++        }
++
++        if (waiter.canceled) {
++            return ORBIS_KERNEL_ERROR_ECANCELED;
++        }
++        if (waiter.deleted) {
++            return ORBIS_KERNEL_ERROR_EACCES;
++        }
++        if (waiter.timed_out) {
++            return ORBIS_KERNEL_ERROR_ETIMEDOUT;
++        }
++        return ORBIS_OK;
++    }
++
++    int Poll(u64 bits, WaitMode wait_mode, ClearMode clear_mode, u64* result) {
++        u32 micros = 0;
++        auto ret = Wait(bits, wait_mode, clear_mode, result, &micros);
++        if (ret == ORBIS_KERNEL_ERROR_ETIMEDOUT) {
++            // Poll reports a flag that is not set yet as EBUSY, not as a timeout.
++            ret = ORBIS_KERNEL_ERROR_EBUSY;
++        }
++        return ret;
++    }
++
++    void Set(u64 bits) {
++        std::unique_lock lock{m_mutex};
++
++        m_bits |= bits;
++
++        for (auto* waiter : m_waiters) {
++            if (!ConditionMet(*waiter)) {
++                continue;
++            }
++            waiter->result = m_bits;
++            ApplyClear(*waiter);
++            waiter->ready = true;
++            waiter->cv.notify_one();
++        }
++    }
++
++    void Clear(u64 bits) {
++        std::scoped_lock lock{m_mutex};
++        // PS4 clears the bits in `bits`. Upstream shadPS4 has `m_bits &= bits`, which keeps only
++        // those bits and drops the rest: a caller that clears one flag loses every other one.
++        m_bits &= ~bits;
++    }
++
++    u64 Pattern() const {
++        std::scoped_lock lock{m_mutex};
++        return m_bits;
++    }
++
++    void Cancel(u64 pattern, int* num_waiters) {
++        std::scoped_lock lock{m_mutex};
++
++        if (num_waiters) {
++            *num_waiters = static_cast<int>(m_waiters.size());
++        }
++
++        m_bits = pattern;
++
++        for (Waiter* waiter : m_waiters) {
++            waiter->result = pattern;
++            waiter->canceled = true;
++            waiter->cv.notify_one();
++        }
++    }
++
++private:
++    mutable std::mutex m_mutex;
++
++    std::list<Waiter*> m_waiters;
++    std::condition_variable m_destroy_cv;
++
++    std::string m_name;
++
++    ThreadMode m_thread_mode;
++    QueueMode m_queue_mode;
++    bool m_deleted = false;
++
++    u64 m_bits = 0;
++};
++
++using OrbisKernelUseconds = u32;
++using OrbisKernelEventFlag = EventFlagInternal*;
++
++struct OrbisKernelEventFlagOptParam {
++    size_t size;
++};
++
++static void ParseWaitMode(u32 wait_mode, EventFlagInternal::WaitMode& wait,
++                          EventFlagInternal::ClearMode& clear) {
++    wait = (wait_mode & 0xf) == ORBIS_KERNEL_EVF_WAITMODE_OR ? EventFlagInternal::WaitMode::Or
++                                                             : EventFlagInternal::WaitMode::And;
++    switch (wait_mode & 0xf0) {
++    case ORBIS_KERNEL_EVF_WAITMODE_CLEAR_ALL:
++        clear = EventFlagInternal::ClearMode::All;
++        break;
++    case ORBIS_KERNEL_EVF_WAITMODE_CLEAR_PAT:
++        clear = EventFlagInternal::ClearMode::Bits;
++        break;
++    default:
++        clear = EventFlagInternal::ClearMode::None;
++        break;
++    }
++}
++
++int PS4_SYSV_ABI sceKernelCreateEventFlag(OrbisKernelEventFlag* ef, const char* pName, u32 attr,
++                                          u64 initPattern,
++                                          const OrbisKernelEventFlagOptParam* pOptParam) {
++    LOG_TRACE(Kernel_Event, "called name = {} attr = {:#x} initPattern = {:#x}", pName ? pName : "",
++              attr, initPattern);
++    if (ef == nullptr || pName == nullptr) {
++        return ORBIS_KERNEL_ERROR_EINVAL;
++    }
++    if (pOptParam != nullptr ||
++        attr > (ORBIS_KERNEL_EVF_ATTR_MULTI | ORBIS_KERNEL_EVF_ATTR_TH_PRIO)) {
++        return ORBIS_KERNEL_ERROR_EINVAL;
++    }
++    if (std::strlen(pName) >= 32) {
++        return ORBIS_KERNEL_ERROR_ENAMETOOLONG;
++    }
++
++    auto thread_mode = EventFlagInternal::ThreadMode::Single;
++    auto queue_mode = EventFlagInternal::QueueMode::Fifo;
++    switch (attr & 0x0fu) {
++    case ORBIS_KERNEL_EVF_ATTR_TH_PRIO:
++        queue_mode = EventFlagInternal::QueueMode::ThreadPrio;
++        break;
++    case ORBIS_KERNEL_EVF_ATTR_TH_FIFO:
++    case 0x00:
++        break;
++    default:
++        return ORBIS_KERNEL_ERROR_EINVAL;
++    }
++    switch (attr & 0xf0u) {
++    case ORBIS_KERNEL_EVF_ATTR_MULTI:
++        thread_mode = EventFlagInternal::ThreadMode::Multi;
++        break;
++    case ORBIS_KERNEL_EVF_ATTR_SINGLE:
++    case 0x00:
++        break;
++    default:
++        return ORBIS_KERNEL_ERROR_EINVAL;
++    }
++
++    *ef = new EventFlagInternal(std::string(pName), thread_mode, queue_mode, initPattern);
++    return ORBIS_OK;
++}
++
++int PS4_SYSV_ABI sceKernelDeleteEventFlag(OrbisKernelEventFlag ef) {
++    if (ef == nullptr) {
++        return ORBIS_KERNEL_ERROR_ESRCH;
++    }
++    LOG_TRACE(Kernel_Event, "called name = {}", ef->GetName());
++    delete ef;
++    return ORBIS_OK;
++}
++
++int PS4_SYSV_ABI sceKernelOpenEventFlag() {
++    LOG_ERROR(Kernel_Event, "(STUBBED) called");
++    return ORBIS_OK;
++}
++
++int PS4_SYSV_ABI sceKernelCloseEventFlag() {
++    LOG_ERROR(Kernel_Event, "(STUBBED) called");
++    return ORBIS_OK;
++}
++
++int PS4_SYSV_ABI sceKernelClearEventFlag(OrbisKernelEventFlag ef, u64 bitPattern) {
++    LOG_TRACE(Kernel_Event, "called bitPattern = {:#x}", bitPattern);
++    if (ef == nullptr) {
++        return ORBIS_KERNEL_ERROR_ESRCH;
++    }
++    ef->Clear(bitPattern);
++    return ORBIS_OK;
++}
++
++int PS4_SYSV_ABI sceKernelCancelEventFlag(OrbisKernelEventFlag ef, u64 setPattern,
++                                          int* pNumWaitThreads) {
++    LOG_DEBUG(Kernel_Event, "called setPattern = {:#x}", setPattern);
++    if (ef == nullptr) {
++        return ORBIS_KERNEL_ERROR_ESRCH;
++    }
++    ef->Cancel(setPattern, pNumWaitThreads);
++    return ORBIS_OK;
++}
++
++int PS4_SYSV_ABI sceKernelSetEventFlag(OrbisKernelEventFlag ef, u64 bitPattern) {
++    LOG_TRACE(Kernel_Event, "called bitPattern = {:#x}", bitPattern);
++    if (ef == nullptr) {
++        return ORBIS_KERNEL_ERROR_ESRCH;
++    }
++    ef->Set(bitPattern);
++    return ORBIS_OK;
++}
++
++int PS4_SYSV_ABI sceKernelPollEventFlag(OrbisKernelEventFlag ef, u64 bitPattern, u32 waitMode,
++                                        u64* pResultPat) {
++    LOG_DEBUG(Kernel_Event, "called bitPattern = {:#x} waitMode = {:#x}", bitPattern, waitMode);
++    if (ef == nullptr) {
++        return ORBIS_KERNEL_ERROR_ESRCH;
++    }
++    if (bitPattern == 0) {
++        return ORBIS_KERNEL_ERROR_EINVAL;
++    }
++
++    EventFlagInternal::WaitMode wait;
++    EventFlagInternal::ClearMode clear;
++    ParseWaitMode(waitMode, wait, clear);
++
++    const int result = ef->Poll(bitPattern, wait, clear, pResultPat);
++    if (result != ORBIS_OK && result != ORBIS_KERNEL_ERROR_EBUSY) {
++        LOG_DEBUG(Kernel_Event, "returned {:#x}", result);
++    }
++    return result;
++}
++
++int PS4_SYSV_ABI sceKernelWaitEventFlag(OrbisKernelEventFlag ef, u64 bitPattern, u32 waitMode,
++                                        u64* pResultPat, OrbisKernelUseconds* pTimeout) {
++    LOG_DEBUG(Kernel_Event, "called bitPattern = {:#x} waitMode = {:#x}", bitPattern, waitMode);
++    if (ef == nullptr) {
++        return ORBIS_KERNEL_ERROR_ESRCH;
++    }
++    if (bitPattern == 0) {
++        return ORBIS_KERNEL_ERROR_EINVAL;
++    }
++
++    EventFlagInternal::WaitMode wait;
++    EventFlagInternal::ClearMode clear;
++    ParseWaitMode(waitMode, wait, clear);
++
++    const int result = ef->Wait(bitPattern, wait, clear, pResultPat, pTimeout);
++    if (result != ORBIS_OK && result != ORBIS_KERNEL_ERROR_ETIMEDOUT) {
++        LOG_DEBUG(Kernel_Event, "returned {:#x}", result);
++    }
++    return result;
++}
++
++void RegisterKernelEventFlag(Core::Loader::SymbolsResolver* sym) {
++    LIB_FUNCTION("PZku4ZrXJqg", "libkernel", 1, "libkernel", sceKernelCancelEventFlag);
++    LIB_FUNCTION("7uhBFWRAS60", "libkernel", 1, "libkernel", sceKernelClearEventFlag);
++    LIB_FUNCTION("s9-RaxukuzQ", "libkernel", 1, "libkernel", sceKernelCloseEventFlag);
++    LIB_FUNCTION("BpFoboUJoZU", "libkernel", 1, "libkernel", sceKernelCreateEventFlag);
++    LIB_FUNCTION("8mql9OcQnd4", "libkernel", 1, "libkernel", sceKernelDeleteEventFlag);
++    LIB_FUNCTION("1vDaenmJtyA", "libkernel", 1, "libkernel", sceKernelOpenEventFlag);
++    LIB_FUNCTION("9lvj5DjHZiA", "libkernel", 1, "libkernel", sceKernelPollEventFlag);
++    LIB_FUNCTION("IOnSvHzqu6A", "libkernel", 1, "libkernel", sceKernelSetEventFlag);
++    LIB_FUNCTION("JTvBflhYazQ", "libkernel", 1, "libkernel", sceKernelWaitEventFlag);
++}
++
++} // namespace Libraries::Kernel
+diff --git a/gpu/shadps4/core/libraries/kernel/eventflag.h b/gpu/shadps4/core/libraries/kernel/eventflag.h
+new file mode 100644
+index 0000000..3a9c379
+--- /dev/null
++++ b/gpu/shadps4/core/libraries/kernel/eventflag.h
+@@ -0,0 +1,18 @@
++// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport: libkernel event flags. Ported from shadPS4 src/core/libraries/kernel/threads/
++// event_flag.cpp because this fork only carried the equeue half of the kernel's event
++// management, and CUSA02716 imports the event-flag half (sceKernelCreateEventFlag and its
++// 5 companions) from libkernel.
++
++#pragma once
++
++namespace Core::Loader {
++class SymbolsResolver;
++}
++
++namespace Libraries::Kernel {
++
++void RegisterKernelEventFlag(Core::Loader::SymbolsResolver* sym);
++
++} // namespace Libraries::Kernel
+diff --git a/gpu/shadps4/core/libraries/zlib/sce_zlib.cpp b/gpu/shadps4/core/libraries/zlib/sce_zlib.cpp
+new file mode 100644
+index 0000000..d3ef675
+--- /dev/null
++++ b/gpu/shadps4/core/libraries/zlib/sce_zlib.cpp
+@@ -0,0 +1,227 @@
++// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport: ported from shadPS4 src/core/libraries/zlib/zlib.cpp.
++//
++// The library is asynchronous by contract: sceZlibInflate only queues the job and hands back a
++// request id, sceZlibWaitForDone blocks until some job finishes, and sceZlibGetResult reports
++// that job's outcome. One worker thread runs the jobs in order on miniz, which this build
++// already links for its texture cache.
++//
++// Differences from upstream: the worker is a plain std::thread with a stop flag instead of a
++// Kernel::Thread with stop tokens (this fork has no guest scheduler to hang it off), so Finalize
++// joins it directly. The accounting counters are new, for runtime_report.
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <mutex>
++#include <queue>
++#include <thread>
++#include <unordered_map>
++
++#include <miniz.h>
++
++#include "common/logging/log.h"
++#include "common/thread.h"
++#include "common/types.h"
++#include "core/libraries/libs.h"
++#include "core/libraries/zlib/sce_zlib.h"
++
++namespace Libraries::Zlib {
++
++namespace {
++
++struct InflateTask {
++    u64 request_id;
++    const void* src;
++    u32 src_length;
++    void* dst;
++    u32 dst_length;
++};
++
++struct InflateResult {
++    u32 length;
++    s32 status;
++};
++
++std::mutex g_mutex;
++std::condition_variable g_task_cv;
++std::condition_variable g_done_cv;
++std::queue<InflateTask> g_task_queue;
++std::queue<u64> g_done_queue;
++std::unordered_map<u64, InflateResult> g_results;
++u64 g_next_request_id = 1;
++bool g_stop = false;
++std::thread g_worker;
++
++// Diagnostics only; read without the lock in the report.
++std::atomic<u64> g_jobs{0};
++std::atomic<u64> g_failures{0};
++std::atomic<u64> g_bytes_out{0};
++
++bool WorkerRunning() {
++    return g_worker.joinable();
++}
++
++void ZlibTaskThread() {
++    Common::SetCurrentThreadName("bb:ZlibTaskThread");
++
++    for (;;) {
++        InflateTask task;
++        {
++            std::unique_lock lock{g_mutex};
++            g_task_cv.wait(lock, [] { return g_stop || !g_task_queue.empty(); });
++            if (g_task_queue.empty()) {
++                return; // stop requested and nothing left to do
++            }
++            task = g_task_queue.front();
++            g_task_queue.pop();
++        }
++
++        // mz_uncompress wants the zlib-wrapped stream the PS4 library is given, not raw deflate.
++        mz_ulong decompressed_length = task.dst_length;
++        const int ret = mz_uncompress(static_cast<u8*>(task.dst), &decompressed_length,
++                                      static_cast<const u8*>(task.src), task.src_length);
++
++        const s32 status = ret == MZ_BUF_ERROR ? ORBIS_ZLIB_ERROR_NOSPACE
++                           : ret == MZ_OK      ? ORBIS_OK
++                                               : ORBIS_ZLIB_ERROR_FATAL;
++        if (status != ORBIS_OK) {
++            ++g_failures;
++        } else {
++            g_bytes_out += decompressed_length;
++        }
++        ++g_jobs;
++
++        {
++            std::lock_guard lock{g_mutex};
++            g_results[task.request_id] =
++                InflateResult{.length = static_cast<u32>(decompressed_length), .status = status};
++            g_done_queue.push(task.request_id);
++        }
++        g_done_cv.notify_one();
++    }
++}
++
++} // namespace
++
++s32 PS4_SYSV_ABI sceZlibInitialize(const void* buffer, u32 length) {
++    LOG_INFO(Lib_Zlib, "called buffer = {}, length = {}", static_cast<const void*>(buffer), length);
++    if (WorkerRunning()) {
++        return ORBIS_ZLIB_ERROR_ALREADY_INITIALIZED;
++    }
++
++    {
++        std::lock_guard lock{g_mutex};
++        g_task_queue = std::queue<InflateTask>();
++        g_done_queue = std::queue<u64>();
++        g_results.clear();
++        g_next_request_id = 1;
++        g_stop = false;
++    }
++
++    g_worker = std::thread{ZlibTaskThread};
++    return ORBIS_OK;
++}
++
++s32 PS4_SYSV_ABI sceZlibInflate(const void* src, u32 src_len, void* dst, u32 dst_len,
++                                u64* request_id) {
++    LOG_DEBUG(Lib_Zlib, "called src_len = {}, dst_len = {}", src_len, dst_len);
++    if (!WorkerRunning()) {
++        return ORBIS_ZLIB_ERROR_NOT_INITIALIZED;
++    }
++    if (!src || !src_len || !dst || !dst_len || !request_id || dst_len > 64_KB ||
++        dst_len % 2_KB != 0) {
++        return ORBIS_ZLIB_ERROR_INVALID;
++    }
++
++    std::lock_guard lock{g_mutex};
++    *request_id = g_next_request_id++;
++    g_task_queue.push(InflateTask{
++        .request_id = *request_id,
++        .src = src,
++        .src_length = src_len,
++        .dst = dst,
++        .dst_length = dst_len,
++    });
++    g_task_cv.notify_one();
++    return ORBIS_OK;
++}
++
++s32 PS4_SYSV_ABI sceZlibWaitForDone(u64* request_id, const u32* timeout) {
++    LOG_DEBUG(Lib_Zlib, "called");
++    if (!WorkerRunning()) {
++        return ORBIS_ZLIB_ERROR_NOT_INITIALIZED;
++    }
++    if (!request_id) {
++        return ORBIS_ZLIB_ERROR_INVALID;
++    }
++
++    std::unique_lock lock{g_mutex};
++    const auto done = [] { return !g_done_queue.empty(); };
++    if (timeout) {
++        if (!g_done_cv.wait_for(lock, std::chrono::milliseconds(*timeout), done)) {
++            return ORBIS_ZLIB_ERROR_TIMEDOUT;
++        }
++    } else {
++        g_done_cv.wait(lock, done);
++    }
++    *request_id = g_done_queue.front();
++    g_done_queue.pop();
++    return ORBIS_OK;
++}
++
++s32 PS4_SYSV_ABI sceZlibGetResult(u64 request_id, u32* dst_length, s32* status) {
++    LOG_DEBUG(Lib_Zlib, "called request_id = {}", request_id);
++    if (!WorkerRunning()) {
++        return ORBIS_ZLIB_ERROR_NOT_INITIALIZED;
++    }
++    if (!dst_length || !status) {
++        return ORBIS_ZLIB_ERROR_INVALID;
++    }
++
++    std::lock_guard lock{g_mutex};
++    const auto it = g_results.find(request_id);
++    if (it == g_results.end()) {
++        return ORBIS_ZLIB_ERROR_NOT_FOUND;
++    }
++    *dst_length = it->second.length;
++    *status = it->second.status;
++    return ORBIS_OK;
++}
++
++s32 PS4_SYSV_ABI sceZlibFinalize() {
++    LOG_INFO(Lib_Zlib, "called");
++    if (!WorkerRunning()) {
++        return ORBIS_ZLIB_ERROR_NOT_INITIALIZED;
++    }
++
++    {
++        std::lock_guard lock{g_mutex};
++        g_stop = true;
++    }
++    g_task_cv.notify_all();
++    g_worker.join();
++
++    std::lock_guard lock{g_mutex};
++    g_task_queue = std::queue<InflateTask>();
++    g_done_queue = std::queue<u64>();
++    g_results.clear();
++    return ORBIS_OK;
++}
++
++void Report() {
++    LOG_INFO(Lib_Zlib, "jobs = {}, failures = {}, bytes out = {}", g_jobs.load(),
++             g_failures.load(), g_bytes_out.load());
++}
++
++void RegisterLib(Core::Loader::SymbolsResolver* sym) {
++    LIB_FUNCTION("m1YErdIXCp4", "libSceZlib", 1, "libSceZlib", sceZlibInitialize);
++    LIB_FUNCTION("6na+Sa-B83w", "libSceZlib", 1, "libSceZlib", sceZlibFinalize);
++    LIB_FUNCTION("TLar1HULv1Q", "libSceZlib", 1, "libSceZlib", sceZlibInflate);
++    LIB_FUNCTION("uB8VlDD4e0s", "libSceZlib", 1, "libSceZlib", sceZlibWaitForDone);
++    LIB_FUNCTION("2eDcGHC0YaM", "libSceZlib", 1, "libSceZlib", sceZlibGetResult);
++}
++
++} // namespace Libraries::Zlib
+diff --git a/gpu/shadps4/core/libraries/zlib/sce_zlib.h b/gpu/shadps4/core/libraries/zlib/sce_zlib.h
+new file mode 100644
+index 0000000..4396b68
+--- /dev/null
++++ b/gpu/shadps4/core/libraries/zlib/sce_zlib.h
+@@ -0,0 +1,39 @@
++// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++// bbport: libSceZlib error codes and entry points, ported from shadPS4
++// src/core/libraries/zlib/. CUSA02716 inflates its 657 `_fpk` archives through this library,
++// so the runtime cannot start without it.
++
++#pragma once
++
++#include "common/types.h"
++
++namespace Core::Loader {
++class SymbolsResolver;
++}
++
++// Zlib library
++constexpr int ORBIS_ZLIB_ERROR_NOT_FOUND = 0x81120002;
++constexpr int ORBIS_ZLIB_ERROR_BUSY = 0x8112000B;
++constexpr int ORBIS_ZLIB_ERROR_FAULT = 0x8112000E;
++constexpr int ORBIS_ZLIB_ERROR_INVALID = 0x81120016;
++constexpr int ORBIS_ZLIB_ERROR_NOSPACE = 0x8112001C;
++constexpr int ORBIS_ZLIB_ERROR_NOT_SUPPORTED = 0x81120025;
++constexpr int ORBIS_ZLIB_ERROR_TIMEDOUT = 0x81120027;
++constexpr int ORBIS_ZLIB_ERROR_NOT_INITIALIZED = 0x81120032;
++constexpr int ORBIS_ZLIB_ERROR_ALREADY_INITIALIZED = 0x81120033;
++constexpr int ORBIS_ZLIB_ERROR_FATAL = 0x811200FF;
++
++namespace Libraries::Zlib {
++
++s32 PS4_SYSV_ABI sceZlibInitialize(const void* buffer, u32 length);
++s32 PS4_SYSV_ABI sceZlibInflate(const void* src, u32 src_len, void* dst, u32 dst_len,
++                                u64* request_id);
++s32 PS4_SYSV_ABI sceZlibWaitForDone(u64* request_id, const u32* timeout);
++s32 PS4_SYSV_ABI sceZlibGetResult(u64 request_id, u32* dst_length, s32* status);
++s32 PS4_SYSV_ABI sceZlibFinalize();
++
++void RegisterLib(Core::Loader::SymbolsResolver* sym);
++void Report();
++
++} // namespace Libraries::Zlib
+diff --git a/gpu/shim/bbgpu.cpp b/gpu/shim/bbgpu.cpp
+index fecf55b..c247abe 100644
+--- a/gpu/shim/bbgpu.cpp
++++ b/gpu/shim/bbgpu.cpp
+@@ -68,6 +68,8 @@ namespace Libraries::GnmDriver { void RegisterLib(Core::Loader::SymbolsResolver*
+ namespace Libraries::AvPlayer { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+ namespace Libraries::VideoOut { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+ namespace Libraries::Kernel { void RegisterEventQueue(Core::Loader::SymbolsResolver* sym); }
++namespace Libraries::Kernel { void RegisterKernelEventFlag(Core::Loader::SymbolsResolver* sym); }
++namespace Libraries::Zlib { void RegisterLib(Core::Loader::SymbolsResolver* sym); }
+ 
+ namespace {
+ struct Symbol {
+@@ -325,6 +327,8 @@ extern "C" void bbgpu_register_kernel(void) {
+     Libraries::Kernel::StartKernelService();
+     Core::Loader::SymbolsResolver resolver;
+     Libraries::Kernel::RegisterEventQueue(&resolver);
++    Libraries::Kernel::RegisterKernelEventFlag(&resolver);
++    Libraries::Zlib::RegisterLib(&resolver);
+     Libraries::AvPlayer::RegisterLib(&resolver);
+ }
+ 
+diff --git a/scripts/game_check.py b/scripts/game_check.py
+index 0de63f0..a46d5b1 100644
+--- a/scripts/game_check.py
++++ b/scripts/game_check.py
+@@ -25,6 +25,12 @@ SUPPORTED_TITLES = ('CUSA00900', 'CUSA00207', 'CUSA00208', 'CUSA00299', 'CUSA013
+                     'CUSA03179', 'CUSA03173', 'CUSA03014', 'CUSA03023')  # US EU JP AS
+ SUPPORTED_VERSION = '01.09'
+ SUPPORTED_IMAGE = '071df19c8880086d97182dbc057bc8cb37badaca57d9112683836b24a0444c0a'
++
++# Port titles: games this fork targets that are not Bloodborne. None of the
++# checks below apply to them (the image hash, the 1.09 update and the shader
++# folder are all Bloodborne specific), so a port title only has to carry a
++# readable param.sfo. Everything else about it is decided by the runtime.
++PORT_TITLES = ('CUSA02716',)  # Kamen Rider Battride War Genesis (JP, 01.02)
+ # The 1.09 executable with Lance McDonald's 60 fps patch applied to it, as some dumps ship it
+ # (seen on US CUSA00900): one of its edits inverts a branch in the menu code (+0xf6d90d) and the
+ # gestures menu crashes the game. bbport has its own 60 fps; the clean 1.09 eboot.bin is needed.
+@@ -77,6 +83,8 @@ def problem(game, image_hash=None):
+     except (OSError, ValueError, IndexError):
+         info = {}
+     title, version = info.get('TITLE_ID', '?'), info.get('APP_VER', '?')
++    if title in PORT_TITLES:
++        return None
+     try:
+         image_hash = image_hash or image_sha256(game)
+         if image_hash == SUPPORTED_IMAGE:
+diff --git a/src/runtime.c b/src/runtime.c
+index d0fae6f..1e4f5f5 100644
+--- a/src/runtime.c
++++ b/src/runtime.c
+@@ -9,6 +9,7 @@
+ #include <stdatomic.h>
+ #include <sched.h>
+ #include <pthread.h>
++#include <math.h>
+ 
+ typedef struct {
+     union { GuestCallback plain; void (ABI *with_arg)(void *); } callback;
+@@ -199,6 +200,13 @@ static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
+     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcmp(a, b, size);
+ }
+ static ABI size_t guest_strlen(const char *text) { return strlen(text); }
++/* libSceLibcInternal's combined sin/cos: the guest imports one call instead of two libm ones,
++ * and both results come from the same argument. */
++static ABI void guest_sincosf(float x, float *sine, float *cosine) {
++    const float s = sinf(x), c = cosf(x);
++    if (sine) *sine = s;
++    if (cosine) *cosine = c;
++}
+ static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
+     printf("Runtime: guest requested exit(%d)\n", status);
+     runtime_finalize(NULL);
+@@ -209,29 +217,30 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
+     if (!(capabilities & 1)) return 0;
+     if (is_data) {
+         static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
+-        if (!strcmp(name, "f7uOxY9mM1U#p#J")) return (uintptr_t)&stack_canary;
+-        if (!strcmp(name, "ZT4ODD2Ts9o#libSceLibcInternal")) return (uintptr_t)&need_libc_internal;
++        if (runtime_key_match(name, "f7uOxY9mM1U#p#J")) return (uintptr_t)&stack_canary;
++        if (runtime_key_match(name, "ZT4ODD2Ts9o#libSceLibcInternal")) return (uintptr_t)&need_libc_internal;
+         return 0;
+     }
+     /* Exact scoped imports for CUSA03173; the suffix identifies library/module. */
+-    if (!strcmp(name, "bzQExy189ZI#q#q")) return (uintptr_t)init_env;
+-    if (!strcmp(name, "8G2LB+A3rzg#q#q")) return (uintptr_t)guest_atexit;
+-    if (!strcmp(name, "tsvEmnenz48#q#q")) return (uintptr_t)guest_cxa_atexit;
+-    if (!strcmp(name, "uMei1W9uyNo#q#q")) return (uintptr_t)guest_libc_exit;
++    if (runtime_key_match(name, "bzQExy189ZI#q#q")) return (uintptr_t)init_env;
++    if (runtime_key_match(name, "8G2LB+A3rzg#q#q")) return (uintptr_t)guest_atexit;
++    if (runtime_key_match(name, "tsvEmnenz48#q#q")) return (uintptr_t)guest_cxa_atexit;
++    if (runtime_key_match(name, "uMei1W9uyNo#q#q")) return (uintptr_t)guest_libc_exit;
+     /* Not imported by the current eboot, exposed for ABI tests/future use. */
+-    if (!strcmp(name, "H2e8t5ScQGc#q#q")) return (uintptr_t)guest_finalize;
+-    if (!strcmp(name, "3GPpjQdAMTw#q#q")) return (uintptr_t)guard_acquire;
+-    if (!strcmp(name, "9rAeANT2tyE#q#q")) return (uintptr_t)guard_release;
+-    if (!strcmp(name, "2emaaluWzUw#q#q")) return (uintptr_t)guard_abort;
+-    if (!strcmp(name, "Ou3iL1abvng#p#J")) return (uintptr_t)stack_fail;
+-    if (!strcmp(name, "8zTFvBIAIN8#q#q")) return (uintptr_t)guest_memset;
+-    if (!strcmp(name, "Q3VBxCXhUHs#q#q")) return (uintptr_t)guest_memcpy;
+-    if (!strcmp(name, "+P6FRGH4LfA#q#q")) return (uintptr_t)guest_memmove;
+-    if (!strcmp(name, "DfivPArhucg#q#q")) return (uintptr_t)guest_memcmp;
+-    if (!strcmp(name, "j4ViWNHEgww#q#q")) return (uintptr_t)guest_strlen;
+-    if (!strcmp(name, "vNe1w4diLCs#p#J")) return (uintptr_t)guest_tls_get_addr;
+-    if (!strcmp(name, "959qrazPIrg#p#J")) return (uintptr_t)guest_procparam;
+-    if (!strcmp(name, "p5EcQeEeJAE#p#J")) return (uintptr_t)guest_set_heap_api;
++    if (runtime_key_match(name, "H2e8t5ScQGc#q#q")) return (uintptr_t)guest_finalize;
++    if (runtime_key_match(name, "3GPpjQdAMTw#q#q")) return (uintptr_t)guard_acquire;
++    if (runtime_key_match(name, "9rAeANT2tyE#q#q")) return (uintptr_t)guard_release;
++    if (runtime_key_match(name, "2emaaluWzUw#q#q")) return (uintptr_t)guard_abort;
++    if (runtime_key_match(name, "Ou3iL1abvng#p#J")) return (uintptr_t)stack_fail;
++    if (runtime_key_match(name, "8zTFvBIAIN8#q#q")) return (uintptr_t)guest_memset;
++    if (runtime_key_match(name, "Q3VBxCXhUHs#q#q")) return (uintptr_t)guest_memcpy;
++    if (runtime_key_match(name, "+P6FRGH4LfA#q#q")) return (uintptr_t)guest_memmove;
++    if (runtime_key_match(name, "DfivPArhucg#q#q")) return (uintptr_t)guest_memcmp;
++    if (runtime_key_match(name, "j4ViWNHEgww#q#q")) return (uintptr_t)guest_strlen;
++    if (runtime_key_match(name, "pztV4AF18iI#")) return (uintptr_t)guest_sincosf;
++    if (runtime_key_match(name, "vNe1w4diLCs#p#J")) return (uintptr_t)guest_tls_get_addr;
++    if (runtime_key_match(name, "959qrazPIrg#p#J")) return (uintptr_t)guest_procparam;
++    if (runtime_key_match(name, "p5EcQeEeJAE#p#J")) return (uintptr_t)guest_set_heap_api;
+     uintptr_t mutex = runtime_mutex_resolve(name);
+     if (mutex) return mutex;
+     uintptr_t thread = runtime_thread_resolve(name);
+@@ -267,10 +276,32 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
+ static const struct { const char *nid, *symbol; } import_names[]={
+ #include "import_names.inc"
+ };
+-/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
++/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it.
++ *
++ * The key is `nid#library-id#module-id`. The library and module ids are slot
++ * indexes encoded per image by scripts/link_modules.py, so the same function
++ * carries a different suffix in every title (CUSA03173 spells libkernel `q#q`,
++ * CUSA02716 spells it `S#E`). The NID alone is a hash of the function name and
++ * is identical everywhere, so fall back to an NID-only match; without it a game
++ * other than the one this table was generated for resolves almost nothing. */
++/* A NID is a hash of the function name, so it is identical in every title; only
++ * the `#library#module` slot suffix is per image (CUSA03173 spells libkernel
++ * `p#J`, CUSA02716 spells it `g#d`). Tables written for one title therefore
++ * still describe the right function for another, as long as the match falls back
++ * to the 11-character NID. Use this from every hand-written key table. */
++int runtime_key_match(const char *query,const char *key) {
++    if (!strcmp(query,key)) return 1;
++    if (strcspn(query,"#")!=11) return 0;
++    return !strncmp(query,key,11) && key[11]=='#';
++}
+ const char *runtime_symbol(const char *nid) {
+     for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
+         if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
++    if (strcspn(nid, "#") != 11) return NULL;  /* not a NID#lib#mod key */
++    for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i) {
++        const char *candidate=import_names[i].nid;
++        if (!strncmp(nid,candidate,11) && candidate[11]=='#') return import_names[i].symbol;
++    }
+     return NULL;
+ }
+ /* Same symbol name means same contract whether imported from libkernel or
+diff --git a/src/runtime.h b/src/runtime.h
+index b0a3b16..a6b8149 100644
+--- a/src/runtime.h
++++ b/src/runtime.h
+@@ -178,6 +178,7 @@ void runtime_content_report(void);
+ typedef struct { const char *name; void *function; } RuntimeExport;
+ #define RUNTIME_LOOKUP(table, nid) runtime_lookup(table, sizeof(table)/sizeof(*(table)), nid)
+ const char *runtime_symbol(const char *nid);
++int runtime_key_match(const char *query, const char *key);
+ uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *nid);
+ uintptr_t runtime_kernel_resolve(const char *name);
+ uintptr_t runtime_file_resolve(const char *name);
+diff --git a/src/runtime_audio.c b/src/runtime_audio.c
+index 2bd3e70..6956cfa 100644
+--- a/src/runtime_audio.c
++++ b/src/runtime_audio.c
+@@ -393,5 +393,12 @@ static const RuntimeExport exports[]={
+     {"sceAudioOutSetVolume",audio_volume}, {"sceAudioOutGetPortState",audio_state},
+     {"sceAudioOutGetLastOutputTime",audio_last_time},
+ };
+-uintptr_t runtime_audio_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
++uintptr_t runtime_audio_resolve(const char *name) {
++    const uintptr_t symbol=RUNTIME_LOOKUP(exports,name);
++    if (symbol) return symbol;
++    /* sceAudioOutOutputs is in the table above; import_names.inc has no entry for CUSA02716's
++     * NID for it, so bind it directly. */
++    if (runtime_key_match(name,"w3PdaSTSwGE#")) return (uintptr_t)audio_outputs;
++    return 0;
++}
+ void runtime_audio_report(void) { printf("Runtime: audio ports opened=%zu, buffers output=%zu\n",ports_opened,buffers_out); }
+diff --git a/src/runtime_content.c b/src/runtime_content.c
+index 9ba5f54..d2545b1 100644
+--- a/src/runtime_content.c
++++ b/src/runtime_content.c
+@@ -16,6 +16,7 @@
+ #define NOT_LOADED ((int32_t)0x805a1001)
+ #define PARAMETER ((int32_t)0x80d90002)
+ #define BUSY ((int32_t)0x80d90003)
++#define CONTENT_NOT_FOUND ((int32_t)0x80d90005)
+ static unsigned refs, initialized, configured;
+ static uint32_t parameters[5];
+ static unsigned queries, lists;
+@@ -126,15 +127,36 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
+     if (count) printf("Runtime: AppContent add-ons reported installed (%s%s): %u\n",builtin ? "The Old Hunters, " : "",root,(unsigned)count);
+     ++lists; return 0;
+ }
++/* DLC mounting (CUSA02716). This fork provides the base game only, so these answer exactly as a
++ * console does when no add-on is installed: mount and the entitlement key report NOT_FOUND and
++ * the title takes its "no DLC" path instead of reading a mount that is not there. */
++static unsigned mount_attempts;
++static ABI int32_t addcont_mount(uint32_t service_label,const void *label,void *mount_point) {
++    if (service_label>7 || !label || !mount_point) return PARAMETER;
++    ++mount_attempts;
++    return CONTENT_NOT_FOUND;
++}
++static ABI int32_t addcont_unmount(void *mount_point) {
++    if (!mount_point) return PARAMETER;
++    return 0;
++}
++static ABI int32_t entitlement_key(uint32_t service_label,const void *label,void *key) {
++    if (service_label>7 || !label || !key) return PARAMETER;
++    return CONTENT_NOT_FOUND;
++}
+ uintptr_t runtime_content_resolve(const char *name) {
+-    if (!strcmp(name,"g8cM39EUZ6o#M#N")) return (uintptr_t)module_load;
+-    if (!strcmp(name,"fMP5NHUOaMk#M#N")) return (uintptr_t)module_loaded;
+-    if (!strcmp(name,"eR2bZFAAU0Q#M#N")) return (uintptr_t)module_unload;
+-    if (!strcmp(name,"R9lA82OraNs#c#d")) return (uintptr_t)content_init;
+-    if (!strcmp(name,"99b82IKXpH4#c#d")) return (uintptr_t)param_int;
+-    if (!strcmp(name,"xnd8BJzAxmk#c#d")) return (uintptr_t)addon_list;
++    if (runtime_key_match(name,"g8cM39EUZ6o#M#N")) return (uintptr_t)module_load;
++    if (runtime_key_match(name,"fMP5NHUOaMk#M#N")) return (uintptr_t)module_loaded;
++    if (runtime_key_match(name,"eR2bZFAAU0Q#M#N")) return (uintptr_t)module_unload;
++    if (runtime_key_match(name,"R9lA82OraNs#c#d")) return (uintptr_t)content_init;
++    if (runtime_key_match(name,"99b82IKXpH4#c#d")) return (uintptr_t)param_int;
++    if (runtime_key_match(name,"xnd8BJzAxmk#c#d")) return (uintptr_t)addon_list;
++    if (runtime_key_match(name,"VANhIWcqYak#")) return (uintptr_t)addcont_mount;
++    if (runtime_key_match(name,"3rHWaV-1KC4#")) return (uintptr_t)addcont_unmount;
++    if (runtime_key_match(name,"XTWR0UXvcgs#")) return (uintptr_t)entitlement_key;
+     return 0;
+ }
+ void runtime_content_report(void) {
+     printf("Runtime: AppContent references=%u, initialized=%u, parameter queries=%u, list queries=%u\n",refs,initialized,queries,lists);
++    if (mount_attempts) printf("Runtime: AppContent DLC mounts requested=%u (no add-on content)\n",mount_attempts);
+ }
+diff --git a/src/runtime_kernel.c b/src/runtime_kernel.c
+index ba6d645..74bc424 100644
+--- a/src/runtime_kernel.c
++++ b/src/runtime_kernel.c
+@@ -303,6 +303,88 @@ static ABI int32_t posix_key_create(uint32_t *k,KeyDestructor d) { int32_t r=key
+ static ABI int32_t posix_key_delete(uint32_t k) { int32_t r=key_delete(k); return r ? r&0xffff : 0; }
+ static ABI int32_t posix_key_set(uint32_t k,void *v) { int32_t r=key_set(k,v); return r ? r&0xffff : 0; }
+ 
++/* --- CUSA02716: the libkernel entries this title imports that the runtime lacked --- */
++/* sceKernel's own time-of-day struct, distinct from libSceRtc's DateTime. */
++typedef struct { int64_t t; uint32_t west_sec, dst_sec; } GuestTimesec;
++typedef struct { int64_t paid; uint64_t caps[4], attrs[4], ucred[8]; } GuestAuthInfo;
++
++/* sceKernelConvertUtcToLocaltime: local = UTC + the offset in force at that instant.
++ * west_sec is the BSD `timezone` value (seconds west of UTC) for standard time, so UTC+8
++ * reports -28800, and dst_sec the daylight part on top of it. */
++static ABI int32_t kernel_utc_to_local(int64_t utc,int64_t *local,GuestTimesec *st,uint64_t *dst_sec) {
++    const time_t seconds=(time_t)utc;
++    struct tm fields;
++    if (!localtime_r(&seconds,&fields)) return ERR(22);
++    const int32_t offset=(int32_t)fields.tm_gmtoff;
++    const uint32_t dst=fields.tm_isdst>0 ? 3600u : 0u;
++    if (local) *local=utc+(int64_t)offset;
++    if (st) { st->t=utc; st->west_sec=(uint32_t)(-offset)+dst; st->dst_sec=dst; }
++    if (dst_sec) *dst_sec=dst;
++    return 0;
++}
++/* sceKernelConvertLocaltimeToUtc: reading the local fields as UTC and letting mktime place them
++ * is the standard step, and it gets the sign right -- upstream shadPS4 subtracts the zone offset
++ * where the conversion needs to add it, so every time outside UTC came back twice the offset off.
++ * `timezone` is an output here, as on the console. */
++static ABI int32_t kernel_local_to_utc(int64_t local,int64_t unused,int64_t *utc,
++                                       GuestTimezone *timezone,int32_t *dst_seconds) {
++    (void)unused;
++    if (!timezone) return ERR(22);
++    kernel_gettimezone(timezone);
++    const time_t local_seconds=(time_t)local;
++    struct tm fields;
++    if (!gmtime_r(&local_seconds,&fields)) return ERR(22);
++    fields.tm_isdst=-1;
++    const time_t result=mktime(&fields);
++    if (result==(time_t)-1) return ERR(22);
++    if (utc) *utc=(int64_t)result;
++    if (dst_seconds) *dst_seconds=fields.tm_isdst>0 ? 3600 : 0;
++    return 0;
++}
++/* sceKernelMlock: the guest pins pages so the kernel cannot page them out. Locking them for real
++ * would spend the process's mlock allowance on pages the runtime keeps resident anyway, and a
++ * title that locks a lot would start failing later calls; with no swap in play the pin buys
++ * nothing, so this succeeds without taking the lock. */
++static ABI int32_t kernel_mlock(void *address,uint64_t length) {
++    (void)address; (void)length;
++    return 0;
++}
++/* posix_msync: flushes a mapping to backing storage. Direct memory is coherent already. */
++static ABI int32_t posix_msync(void *address,uint64_t length,int32_t flags) {
++    (void)address; (void)length; (void)flags;
++    return 0;
++}
++/* sceKernelGetCompiledSdkVersion: the SDK this title was built against. 0x05050000 is 5.50 --
++ * the range a 2016 release was built in; titles branch on the major version for feature
++ * availability, so any recent value takes the same path. */
++static ABI int32_t kernel_compiled_sdk_version(int32_t *version) {
++    if (!version) return ERR(22);
++    *version=0x05050000;
++    return 0;
++}
++/* Module introspection: the runtime maps one image and has no module list to search, so both
++ * lookups clear the caller's buffer and report "no such module" -- the answer a title's stack
++ * unwinder already handles, since the same call fails for any address inside libc. */
++static ABI int32_t kernel_module_info_missing(uint64_t address,int32_t flags,void *info) {
++    (void)address;
++    if (!info) return ERR(14); /* EFAULT */
++    uint64_t size=*(const uint64_t *)info; /* st_size is the first field of both structs */
++    if (size<8) return ERR(22);
++    if (size>0x120) size=0x120; /* never write past what the two layouts need */
++    memset(info,0,(size_t)size);
++    if (flags>=3) return ERR(22);
++    return ERR(3); /* ESRCH */
++}
++/* get_authinfo: the credential of the calling process. A title reads caps to learn what it is
++ * allowed to do; the console grants the game the 0x2000... capability word and nothing else. */
++static ABI int32_t kernel_get_authinfo(int32_t pid,GuestAuthInfo *info) {
++    if (!info) return ERR(1); /* EPERM */
++    if (pid!=0 && pid!=-1 && pid!=1) return ERR(3); /* ESRCH */
++    memset(info,0,sizeof(*info));
++    info->caps[0]=UINT64_C(0x2000000000000000);
++    return 0;
++}
++
+ static const RuntimeExport exports[]={
+     {"sceKernelClockGettime",kernel_clock_gettime}, {"clock_gettime",posix_clock_gettime},
+     {"clock_getres",posix_clock_getres},
+@@ -327,8 +409,31 @@ static const RuntimeExport exports[]={
+     {"scePthreadSetspecific",key_set}, {"scePthreadGetspecific",key_get},
+     {"pthread_key_create",posix_key_create}, {"pthread_key_delete",posix_key_delete},
+     {"pthread_setspecific",posix_key_set}, {"pthread_getspecific",key_get},
++    {"sceKernelConvertUtcToLocaltime",kernel_utc_to_local},
++    {"sceKernelConvertLocaltimeToUtc",kernel_local_to_utc},
++    {"sceKernelMlock",kernel_mlock}, {"msync",posix_msync}, {"posix_msync",posix_msync},
++    {"sceKernelGetCompiledSdkVersion",kernel_compiled_sdk_version},
++    {"sceKernelGetModuleInfoFromAddr",kernel_module_info_missing},
++    {"sceKernelGetModuleInfoForUnwind",kernel_module_info_missing},
++    {"get_authinfo",kernel_get_authinfo},
+ };
+-uintptr_t runtime_kernel_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
++uintptr_t runtime_kernel_resolve(const char *name) {
++    const uintptr_t symbol=RUNTIME_LOOKUP(exports,name);
++    if (symbol) return symbol;
++    /* Implemented in the exports table above, but import_names.inc (generated from another
++     * title's imports) has no entry for these NIDs, so bind them directly. Without this the
++     * name lookup has nothing to find. */
++    if (runtime_key_match(name,"1j3S3n-tTW4#")) return (uintptr_t)tsc_frequency;
++    if (runtime_key_match(name,"-o5uEDpN+oY#")) return (uintptr_t)kernel_utc_to_local;
++    if (runtime_key_match(name,"0NTHN1NKONI#")) return (uintptr_t)kernel_local_to_utc;
++    if (runtime_key_match(name,"3k6kx-zOOSQ#")) return (uintptr_t)kernel_mlock;
++    if (runtime_key_match(name,"tZY4+SZNFhA#")) return (uintptr_t)posix_msync;
++    if (runtime_key_match(name,"WB66evu8bsU#")) return (uintptr_t)kernel_compiled_sdk_version;
++    if (runtime_key_match(name,"f7KBOafysXo#")) return (uintptr_t)kernel_module_info_missing;
++    if (runtime_key_match(name,"RpQJJVKTiFM#")) return (uintptr_t)kernel_module_info_missing;
++    if (runtime_key_match(name,"igMefp4SAv0#")) return (uintptr_t)kernel_get_authinfo;
++    return 0;
++}
+ #else
+ uintptr_t runtime_kernel_resolve(const char *name) { (void)name; return 0; }
+ int32_t runtime_guest_errno(int e) { return e ? 5 : 0; }
+diff --git a/src/runtime_memory.c b/src/runtime_memory.c
+index bf4288c..8ab60b1 100644
+--- a/src/runtime_memory.c
++++ b/src/runtime_memory.c
+@@ -745,11 +745,11 @@ static const RuntimeExport exports[]={
+ };
+ uintptr_t runtime_memory_resolve(const char *name) {
+     /* Direct-memory NIDs are exercised by test_runtime.c before names are loaded. */
+-    if (!strcmp(name, "pO96TwzOm5E#p#J")) return (uintptr_t)direct_size;
+-    if (!strcmp(name, "rTXw65xmLIA#p#J")) return (uintptr_t)direct_allocate;
+-    if (!strcmp(name, "L-Q3LEjIbgA#p#J")) return (uintptr_t)direct_map;
+-    if (!strcmp(name, "MBuItvba6z8#p#J")) return (uintptr_t)direct_release;
+-    if (!strcmp(name, "cQke9UuBQOk#p#J")) return (uintptr_t)direct_unmap;
++    if (runtime_key_match(name, "pO96TwzOm5E#p#J")) return (uintptr_t)direct_size;
++    if (runtime_key_match(name, "rTXw65xmLIA#p#J")) return (uintptr_t)direct_allocate;
++    if (runtime_key_match(name, "L-Q3LEjIbgA#p#J")) return (uintptr_t)direct_map;
++    if (runtime_key_match(name, "MBuItvba6z8#p#J")) return (uintptr_t)direct_release;
++    if (runtime_key_match(name, "cQke9UuBQOk#p#J")) return (uintptr_t)direct_unmap;
+     return RUNTIME_LOOKUP(exports,name);
+ }
+ /* Host-owned memory the guest can see (image, stacks, trampolines) lives in
+diff --git a/src/runtime_mutex.c b/src/runtime_mutex.c
+index caa3f69..f4ce8c7 100644
+--- a/src/runtime_mutex.c
++++ b/src/runtime_mutex.c
+@@ -143,6 +143,22 @@ static ABI int32_t cond_init(GuestCond **out, void **attr, const char *name) {
+     if (e) { free(c); return orbis_error(e); }
+     *out = c; ++conds; return 0;
+ }
++/* Condition variable attributes: every cond above runs on CLOCK_REALTIME, so the attribute
++ * carries nothing but its own identity. A game that only runs the SDK's init/destroy pair
++ * (which is what CUSA02716 does) gets exactly the default behaviour it asks for. */
++typedef struct { uint32_t magic; } GuestCondAttr;
++#define COND_ATTR_MAGIC UINT32_C(0x434f4e44) /* 'COND' */
++static ABI int32_t condattr_init(GuestCondAttr **out) {
++    if (!out) return orbis_error(EINVAL);
++    GuestCondAttr *a = malloc(sizeof(*a));
++    if (!a) return orbis_error(ENOMEM);
++    a->magic = COND_ATTR_MAGIC;
++    *out = a; return 0;
++}
++static ABI int32_t condattr_destroy(GuestCondAttr **attr) {
++    if (!attr || !*attr) return orbis_error(EINVAL);
++    free(*attr); *attr = NULL; return 0;
++}
+ /* Handles 0/1 are static initializers, 2 marks a destroyed cond (EINVAL, as on
+  * FreeBSD). Each call reads the handle once: a guest thread may destroy the cond
+  * while another still signals it (seen when a movie's player threads shut down). */
+@@ -246,36 +262,40 @@ static ABI int32_t posix_cond_timedwait(GuestCond **c, GuestMutex **m, const Gue
+ static ABI int32_t posix_cond_signal(GuestCond **c) { return posix_result(cond_signal(c)); }
+ static ABI int32_t posix_cond_broadcast(GuestCond **c) { return posix_result(cond_broadcast(c)); }
+ uintptr_t runtime_mutex_resolve(const char *name) {
+-    if (!strcmp(name,"0TyVk4MSLt0#I#J")) return (uintptr_t)posix_cond_init;
+-    if (!strcmp(name,"RXXqi4CtF8w#I#J")) return (uintptr_t)posix_cond_destroy;
+-    if (!strcmp(name,"Op8TBGY5KHg#I#J")) return (uintptr_t)posix_cond_wait;
+-    if (!strcmp(name,"27bAgiJmOh0#I#J")) return (uintptr_t)posix_cond_timedwait;
+-    if (!strcmp(name,"2MOy+rUfuhQ#I#J")) return (uintptr_t)posix_cond_signal;
+-    if (!strcmp(name,"mkx2fVhNMsg#I#J")) return (uintptr_t)posix_cond_broadcast;
+-    if (!strcmp(name,"2Tb92quprl0#p#J")) return (uintptr_t)cond_init;
+-    if (!strcmp(name,"g+PZd2hiacg#p#J")) return (uintptr_t)cond_destroy;
+-    if (!strcmp(name,"WKAXJ4XBPQ4#p#J")) return (uintptr_t)cond_wait;
+-    if (!strcmp(name,"BmMjYxmew1w#p#J")) return (uintptr_t)cond_timedwait;
+-    if (!strcmp(name,"kDh-NfxgMtE#p#J")) return (uintptr_t)cond_signal;
+-    if (!strcmp(name,"JGgj7Uvrl+A#p#J")) return (uintptr_t)cond_broadcast;
+-    if (!strcmp(name,"IafI2PxcPnQ#p#J")) return (uintptr_t)mutex_timedlock;
+-    if (!strcmp(name,"dQHWEsJtoE4#I#J")) return (uintptr_t)posix_attr_init;
+-    if (!strcmp(name,"mDmgMOGVUqg#I#J")) return (uintptr_t)posix_attr_type;
+-    if (!strcmp(name,"HF7lK46xzjY#I#J")) return (uintptr_t)posix_attr_destroy;
+-    if (!strcmp(name,"ttHNfU+qDBU#I#J")) return (uintptr_t)posix_mutex_init;
+-    if (!strcmp(name,"ltCfaGr2JGE#I#J")) return (uintptr_t)posix_mutex_destroy;
+-    if (!strcmp(name,"7H0iTOciTLo#I#J")) return (uintptr_t)posix_mutex_lock;
+-    if (!strcmp(name,"K-jXhbt2gn4#I#J")) return (uintptr_t)posix_mutex_trylock;
+-    if (!strcmp(name,"2Z+PpY6CaJg#I#J")) return (uintptr_t)posix_mutex_unlock;
+-    if (!strcmp(name, "F8bUHwAG284#p#J")) return (uintptr_t)attr_init;
+-    if (!strcmp(name, "iMp8QpE+XO4#p#J")) return (uintptr_t)attr_type;
+-    if (!strcmp(name, "smWEktiyyG0#p#J")) return (uintptr_t)attr_destroy;
+-    if (!strcmp(name, "1FGvU0i9saQ#p#J")) return (uintptr_t)attr_protocol;
+-    if (!strcmp(name, "cmo1RIYva9o#p#J")) return (uintptr_t)mutex_init;
+-    if (!strcmp(name, "9UK1vLZQft4#p#J")) return (uintptr_t)mutex_lock;
+-    if (!strcmp(name, "upoVrzMHFeE#p#J")) return (uintptr_t)mutex_trylock;
+-    if (!strcmp(name, "tn3VlD0hG60#p#J")) return (uintptr_t)mutex_unlock;
+-    if (!strcmp(name, "2Of0f+3mhhE#p#J")) return (uintptr_t)mutex_destroy;
++    if (runtime_key_match(name,"0TyVk4MSLt0#I#J")) return (uintptr_t)posix_cond_init;
++    if (runtime_key_match(name,"RXXqi4CtF8w#I#J")) return (uintptr_t)posix_cond_destroy;
++    if (runtime_key_match(name,"Op8TBGY5KHg#I#J")) return (uintptr_t)posix_cond_wait;
++    if (runtime_key_match(name,"27bAgiJmOh0#I#J")) return (uintptr_t)posix_cond_timedwait;
++    if (runtime_key_match(name,"2MOy+rUfuhQ#I#J")) return (uintptr_t)posix_cond_signal;
++    if (runtime_key_match(name,"mkx2fVhNMsg#I#J")) return (uintptr_t)posix_cond_broadcast;
++    if (runtime_key_match(name,"2Tb92quprl0#p#J")) return (uintptr_t)cond_init;
++    if (runtime_key_match(name,"g+PZd2hiacg#p#J")) return (uintptr_t)cond_destroy;
++    if (runtime_key_match(name,"WKAXJ4XBPQ4#p#J")) return (uintptr_t)cond_wait;
++    if (runtime_key_match(name,"BmMjYxmew1w#p#J")) return (uintptr_t)cond_timedwait;
++    if (runtime_key_match(name,"kDh-NfxgMtE#p#J")) return (uintptr_t)cond_signal;
++    if (runtime_key_match(name,"JGgj7Uvrl+A#p#J")) return (uintptr_t)cond_broadcast;
++    if (runtime_key_match(name,"IafI2PxcPnQ#p#J")) return (uintptr_t)mutex_timedlock;
++    if (runtime_key_match(name,"dQHWEsJtoE4#I#J")) return (uintptr_t)posix_attr_init;
++    if (runtime_key_match(name,"mDmgMOGVUqg#I#J")) return (uintptr_t)posix_attr_type;
++    if (runtime_key_match(name,"HF7lK46xzjY#I#J")) return (uintptr_t)posix_attr_destroy;
++    if (runtime_key_match(name,"ttHNfU+qDBU#I#J")) return (uintptr_t)posix_mutex_init;
++    if (runtime_key_match(name,"ltCfaGr2JGE#I#J")) return (uintptr_t)posix_mutex_destroy;
++    if (runtime_key_match(name,"7H0iTOciTLo#I#J")) return (uintptr_t)posix_mutex_lock;
++    if (runtime_key_match(name,"K-jXhbt2gn4#I#J")) return (uintptr_t)posix_mutex_trylock;
++    if (runtime_key_match(name,"2Z+PpY6CaJg#I#J")) return (uintptr_t)posix_mutex_unlock;
++    if (runtime_key_match(name, "F8bUHwAG284#p#J")) return (uintptr_t)attr_init;
++    if (runtime_key_match(name, "iMp8QpE+XO4#p#J")) return (uintptr_t)attr_type;
++    if (runtime_key_match(name, "smWEktiyyG0#p#J")) return (uintptr_t)attr_destroy;
++    if (runtime_key_match(name, "1FGvU0i9saQ#p#J")) return (uintptr_t)attr_protocol;
++    if (runtime_key_match(name, "cmo1RIYva9o#p#J")) return (uintptr_t)mutex_init;
++    if (runtime_key_match(name, "9UK1vLZQft4#p#J")) return (uintptr_t)mutex_lock;
++    if (runtime_key_match(name, "upoVrzMHFeE#p#J")) return (uintptr_t)mutex_trylock;
++    if (runtime_key_match(name, "tn3VlD0hG60#p#J")) return (uintptr_t)mutex_unlock;
++    if (runtime_key_match(name, "2Of0f+3mhhE#p#J")) return (uintptr_t)mutex_destroy;
++    /* CUSA02716 imports the scePthread* spelling from libkernel rather than the posix_*
++     * aliases above; the same cond attributes back both. */
++    if (runtime_key_match(name, "m5-2bsNfv7s#")) return (uintptr_t)condattr_init;
++    if (runtime_key_match(name, "waPcxYiR3WA#")) return (uintptr_t)condattr_destroy;
+     return 0;
+ }
+ void runtime_mutex_report(void) {
+@@ -290,18 +310,18 @@ static ABI int32_t posix_cond_timedwait(GuestCond **c, GuestMutex **m, const Gue
+ static ABI int32_t posix_cond_signal(GuestCond **c) { return posix_result(cond_signal(c)); }
+ static ABI int32_t posix_cond_broadcast(GuestCond **c) { return posix_result(cond_broadcast(c)); }
+ uintptr_t runtime_mutex_resolve(const char *name) {
+-    if (!strcmp(name,"0TyVk4MSLt0#I#J")) return (uintptr_t)posix_cond_init;
+-    if (!strcmp(name,"RXXqi4CtF8w#I#J")) return (uintptr_t)posix_cond_destroy;
+-    if (!strcmp(name,"Op8TBGY5KHg#I#J")) return (uintptr_t)posix_cond_wait;
+-    if (!strcmp(name,"27bAgiJmOh0#I#J")) return (uintptr_t)posix_cond_timedwait;
+-    if (!strcmp(name,"2MOy+rUfuhQ#I#J")) return (uintptr_t)posix_cond_signal;
+-    if (!strcmp(name,"mkx2fVhNMsg#I#J")) return (uintptr_t)posix_cond_broadcast;
+-    if (!strcmp(name,"2Tb92quprl0#p#J")) return (uintptr_t)cond_init;
+-    if (!strcmp(name,"g+PZd2hiacg#p#J")) return (uintptr_t)cond_destroy;
+-    if (!strcmp(name,"WKAXJ4XBPQ4#p#J")) return (uintptr_t)cond_wait;
+-    if (!strcmp(name,"BmMjYxmew1w#p#J")) return (uintptr_t)cond_timedwait;
+-    if (!strcmp(name,"kDh-NfxgMtE#p#J")) return (uintptr_t)cond_signal;
+-    if (!strcmp(name,"JGgj7Uvrl+A#p#J")) return (uintptr_t)cond_broadcast;
+-    if (!strcmp(name,"IafI2PxcPnQ#p#J")) return (uintptr_t)mutex_timedlock; (void)name; return 0; }
++    if (runtime_key_match(name,"0TyVk4MSLt0#I#J")) return (uintptr_t)posix_cond_init;
++    if (runtime_key_match(name,"RXXqi4CtF8w#I#J")) return (uintptr_t)posix_cond_destroy;
++    if (runtime_key_match(name,"Op8TBGY5KHg#I#J")) return (uintptr_t)posix_cond_wait;
++    if (runtime_key_match(name,"27bAgiJmOh0#I#J")) return (uintptr_t)posix_cond_timedwait;
++    if (runtime_key_match(name,"2MOy+rUfuhQ#I#J")) return (uintptr_t)posix_cond_signal;
++    if (runtime_key_match(name,"mkx2fVhNMsg#I#J")) return (uintptr_t)posix_cond_broadcast;
++    if (runtime_key_match(name,"2Tb92quprl0#p#J")) return (uintptr_t)cond_init;
++    if (runtime_key_match(name,"g+PZd2hiacg#p#J")) return (uintptr_t)cond_destroy;
++    if (runtime_key_match(name,"WKAXJ4XBPQ4#p#J")) return (uintptr_t)cond_wait;
++    if (runtime_key_match(name,"BmMjYxmew1w#p#J")) return (uintptr_t)cond_timedwait;
++    if (runtime_key_match(name,"kDh-NfxgMtE#p#J")) return (uintptr_t)cond_signal;
++    if (runtime_key_match(name,"JGgj7Uvrl+A#p#J")) return (uintptr_t)cond_broadcast;
++    if (runtime_key_match(name,"IafI2PxcPnQ#p#J")) return (uintptr_t)mutex_timedlock; (void)name; return 0; }
+ void runtime_mutex_report(void) { puts("Runtime: Windows mutex backend not implemented"); }
+ #endif
+diff --git a/src/runtime_pad.c b/src/runtime_pad.c
+index 998656d..1ace121 100644
+--- a/src/runtime_pad.c
++++ b/src/runtime_pad.c
+@@ -752,6 +752,9 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
+ }
+ static ABI int32_t pad_ok_handle(int32_t handle) { return handle==PAD_HANDLE && opened ? 0 : ERR_INVALID_HANDLE; }
+ static ABI int32_t pad_ok_handle_flag(int32_t handle, uint8_t flag) { (void)flag; return pad_ok_handle(handle); }
++/* scePadSetLightBar: a phone has no light bar to drive. The handle is still checked, because a
++ * title treats an invalid handle as "the pad is gone" and stops reading input. */
++static ABI int32_t pad_lightbar(int32_t handle, const void *param) { (void)param; return pad_ok_handle(handle); }
+ 
+ static const RuntimeExport exports[]={
+     {"scePadInit",pad_init}, {"scePadOpen",pad_open}, {"scePadClose",pad_close},
+@@ -760,8 +763,14 @@ static const RuntimeExport exports[]={
+     {"scePadResetOrientation",pad_ok_handle},
+     {"scePadSetAngularVelocityDeadbandState",pad_ok_handle_flag}, {"scePadSetTiltCorrectionState",pad_ok_handle_flag},
+     {"scePadSetMotionSensorState",pad_ok_handle_flag},
++    {"scePadSetLightBar",pad_lightbar},
+ };
+-uintptr_t runtime_pad_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
++uintptr_t runtime_pad_resolve(const char *name) {
++    const uintptr_t symbol=RUNTIME_LOOKUP(exports,name);
++    if (symbol) return symbol;
++    if (runtime_key_match(name,"RR4novUEENY#")) return (uintptr_t)pad_lightbar;
++    return 0;
++}
+ #ifdef BB_NO_SDL
+ void runtime_pad_report(void) { printf("Runtime: pad reads=%zu\n",reads); }
+ #else
+diff --git a/src/runtime_rtc.c b/src/runtime_rtc.c
+index 055b037..04e6e72 100644
+--- a/src/runtime_rtc.c
++++ b/src/runtime_rtc.c
+@@ -116,6 +116,8 @@ static ABI int32_t rtc_set_time_t(DateTime *t, int64_t seconds) {
+     if (seconds<0) return (int32_t)0x80B50003; /* INVALID_VALUE */
+     from_tick(UNIX_EPOCH_TICKS+(uint64_t)seconds*1000000u,t); return 0;
+ }
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wunused-function"
+ static ABI int32_t rtc_get_time_t(const DateTime *t, int64_t *seconds) {
+     if (!t || !seconds) return ERR_INVALID_POINTER;
+     int32_t e=validate(t);
+@@ -140,6 +142,132 @@ static ABI int32_t rtc_rfc2822_local(char *out, const uint64_t *utc_tick) {
+     return 0;
+ }
+ 
++/* --- Date/time string parsing (CUSA02716 imports these from libSceRtc) --- */
++/* Reads `count` decimal digits at s; 0 when one is not a digit. */
++static int take_digits(const char *s,int count,int *out) {
++    int value=0;
++    for (int i=0;i<count;++i) {
++        if (s[i]<'0' || s[i]>'9') return 0;
++        value=value*10+(s[i]-'0');
++    }
++    *out=value;
++    return 1;
++}
++/* Fractional-second digits starting at s (after the '.'): scaled to microseconds. */
++static int take_fraction(const char *s,uint32_t *micros) {
++    uint32_t value=0;
++    int digits=0, scale=100000;
++    while (digits<6 && s[digits]>='0' && s[digits]<='9') {
++        value+=(uint32_t)(s[digits]-'0')*scale;
++        scale/=10; ++digits;
++    }
++    /* Digits past the sixth only matter for rounding, which a microsecond tick cannot show. */
++    while (s[digits]>='0' && s[digits]<='9') ++digits;
++    *micros=value;
++    return digits;
++}
++static ABI int32_t rtc_parse_rfc3339(uint64_t *tick,const char *text) {
++    if (!tick || !text) return ERR_INVALID_POINTER;
++    DateTime t; memset(&t,0,sizeof(t));
++    int year,month,day,hour,minute,second;
++    if (strlen(text)<19 || !take_digits(text,4,&year) || !take_digits(text+5,2,&month) ||
++        !take_digits(text+8,2,&day) || !take_digits(text+11,2,&hour) ||
++        !take_digits(text+14,2,&minute) || !take_digits(text+17,2,&second))
++        return (int32_t)0x80B50003; /* INVALID_VALUE */
++    t.year=(uint16_t)year; t.month=(uint16_t)month; t.day=(uint16_t)day;
++    t.hour=(uint16_t)hour; t.minute=(uint16_t)minute; t.second=(uint16_t)second;
++    const char *rest=text+19;
++    if (*rest=='.') {
++        const int digits=take_fraction(rest+1,&t.microsecond);
++        rest+=1+digits;
++    }
++    int32_t e=validate(&t);
++    if (e) return e;
++    /* A zone designator makes the text local to that offset: UTC = local - offset.
++     * Upstream shadPS4 adds the offset here, which moves the result the wrong way by twice
++     * the offset. */
++    int64_t minutes=0;
++    if (*rest=='+' || *rest=='-') {
++        int hours=0,mins=0;
++        if (!take_digits(rest+1,2,&hours) || !take_digits(rest+4,2,&mins))
++            return (int32_t)0x80B50003;
++        minutes=hours*60+mins;
++        if (*rest=='-') minutes=-minutes;
++    } else if (*rest!='Z' && *rest!='\0') {
++        return (int32_t)0x80B50003;
++    }
++    *tick=to_tick(&t)-(uint64_t)(minutes*60000000);
++    return 0;
++}
++/* RFC3339, RFC2822 ("Wed, 25 Sep 2026 12:00:00 +0300") or asctime, picked by the format flag
++ * where upstream shadPS4 looks for it. */
++static ABI int32_t rtc_parse_datetime(uint64_t *tick,const char *text) {
++    if (!tick || !text) return ERR_INVALID_POINTER;
++    const size_t length=strlen(text);
++    if (length<=19) return (int32_t)0x80B50003;
++    const char flag=text[19];
++    if (flag=='Z' || flag=='-' || flag=='+' || flag=='.') return rtc_parse_rfc3339(tick,text);
++    DateTime t; memset(&t,0,sizeof(t));
++    int value=0;
++    if (flag==':') {
++        static const char *names[]={"Jan","Feb","Mar","Apr","May","Jun",
++                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
++        if (length<25 || !take_digits(text+5,2,&value)) return (int32_t)0x80B50003;
++        t.day=(uint16_t)value;
++        for (int i=0;i<12;++i)
++            if (!strncmp(text+8,names[i],3)) { t.month=(uint16_t)(i+1); break; }
++        if (!t.month || !take_digits(text+12,4,&value)) return (int32_t)0x80B50003;
++        t.year=(uint16_t)value;
++        if (!take_digits(text+17,2,&value)) return (int32_t)0x80B50003;
++        t.hour=(uint16_t)value;
++        if (!take_digits(text+20,2,&value)) return (int32_t)0x80B50003;
++        t.minute=(uint16_t)value;
++        if (!take_digits(text+23,2,&value)) return (int32_t)0x80B50003;
++        t.second=(uint16_t)value;
++        int32_t e=validate(&t);
++        if (e) return e;
++        int64_t minutes=0;
++        if (length>=31 && (text[26]=='+' || text[26]=='-')) {
++            int hours=0,mins=0;
++            if (!take_digits(text+27,2,&hours) || !take_digits(text+29,2,&mins))
++                return (int32_t)0x80B50003;
++            minutes=hours*60+mins;
++            if (text[26]=='-') minutes=-minutes;
++        }
++        *tick=to_tick(&t)-(uint64_t)(minutes*60000000);
++        return 0;
++    }
++    /* asctime: "Wed Sep 25 12:00:00 2026" */
++    static const char *names[]={"Jan","Feb","Mar","Apr","May","Jun",
++                                "Jul","Aug","Sep","Oct","Nov","Dec"};
++    for (int i=0;i<12;++i)
++        if (!strncmp(text+4,names[i],3)) { t.month=(uint16_t)(i+1); break; }
++    if (!t.month || length<24) return (int32_t)0x80B50003;
++    if (!take_digits(text+8,2,&value)) return (int32_t)0x80B50003;
++    t.day=(uint16_t)value;
++    if (!take_digits(text+11,2,&value)) return (int32_t)0x80B50003;
++    t.hour=(uint16_t)value;
++    if (!take_digits(text+14,2,&value)) return (int32_t)0x80B50003;
++    t.minute=(uint16_t)value;
++    if (!take_digits(text+17,2,&value)) return (int32_t)0x80B50003;
++    t.second=(uint16_t)value;
++    if (!take_digits(text+20,4,&value)) return (int32_t)0x80B50003;
++    t.year=(uint16_t)value;
++    const int32_t e=validate(&t);
++    if (e) return e;
++    *tick=to_tick(&t);
++    return 0;
++}
++/* Destination may be the source: the write happens after the read. */
++static ABI int32_t rtc_tick_add_minutes(uint64_t *dest,const uint64_t *src,int64_t minutes) {
++    if (!dest || !src) return ERR_INVALID_POINTER;
++    const uint64_t base=*src;
++    const int64_t delta=minutes*60000000;
++    *dest=delta<0 ? base-(uint64_t)(-delta) : base+(uint64_t)delta;
++    return 0;
++}
++#pragma GCC diagnostic pop
++
+ static const RuntimeExport exports[]={
+     {"sceRtcGetCurrentClockLocalTime",rtc_current_local}, {"sceRtcGetCurrentClock",rtc_current_clock},
+     {"sceRtcGetCurrentTick",rtc_current_tick}, {"sceRtcGetCurrentNetworkTick",rtc_current_tick},
+@@ -148,4 +276,15 @@ static const RuntimeExport exports[]={
+     {"sceRtcGetTickResolution",rtc_tick_resolution}, {"sceRtcSetTime_t",rtc_set_time_t},
+     {"sceRtcGetTime_t",rtc_get_time_t}, {"sceRtcFormatRFC2822LocalTime",rtc_rfc2822_local},
+ };
+-uintptr_t runtime_rtc_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
++uintptr_t runtime_rtc_resolve(const char *name) {
++    const uintptr_t symbol=RUNTIME_LOOKUP(exports,name);
++    if (symbol) return symbol;
++    /* import_names.inc was generated from another title's import list, so it has no entry for
++     * the libSceRtc functions only CUSA02716 imports (the names resolve for Bloodborne's own
++     * NIDs). Bind them by NID instead of growing a table keyed on one game. */
++    if (runtime_key_match(name,"18B2NS1y9UU#")) return (uintptr_t)rtc_current_tick;
++    if (runtime_key_match(name,"NxEI1KByvCI#")) return (uintptr_t)rtc_parse_datetime;
++    if (runtime_key_match(name,"99bMGglFW3I#")) return (uintptr_t)rtc_parse_rfc3339;
++    if (runtime_key_match(name,"mn-tf4QiFzk#")) return (uintptr_t)rtc_tick_add_minutes;
++    return 0;
++}
+diff --git a/src/runtime_rwlock.c b/src/runtime_rwlock.c
+index bfa3562..e3a9c5f 100644
+--- a/src/runtime_rwlock.c
++++ b/src/runtime_rwlock.c
+@@ -144,15 +144,15 @@ static ABI int32_t rw_destroy(Rwlock **handle) {
+     pthread_mutex_unlock(&registry_lock); return error(e);
+ }
+ uintptr_t runtime_rwlock_resolve(const char *name) {
+-    if (!strcmp(name,"6ULAa0fq4jA#p#J")) return (uintptr_t)rw_init;
+-    if (!strcmp(name,"BB+kb08Tl9A#p#J")) return (uintptr_t)rw_destroy;
+-    if (!strcmp(name,"Ox9i0c7L5w0#p#J")) return (uintptr_t)rw_read;
+-    if (!strcmp(name,"mqdNorrB+gI#p#J")) return (uintptr_t)rw_write;
+-    if (!strcmp(name,"XD3mDeybCnk#p#J")) return (uintptr_t)rw_tryread;
+-    if (!strcmp(name,"bIHoZCTomsI#p#J")) return (uintptr_t)rw_trywrite;
+-    if (!strcmp(name,"+L98PIbGttk#p#J")) return (uintptr_t)rw_unlock;
+-    if (!strcmp(name,"iPtZRWICjrM#p#J")) return (uintptr_t)rw_timedread;
+-    if (!strcmp(name,"adh--6nIqTk#p#J")) return (uintptr_t)rw_timedwrite;
++    if (runtime_key_match(name,"6ULAa0fq4jA#p#J")) return (uintptr_t)rw_init;
++    if (runtime_key_match(name,"BB+kb08Tl9A#p#J")) return (uintptr_t)rw_destroy;
++    if (runtime_key_match(name,"Ox9i0c7L5w0#p#J")) return (uintptr_t)rw_read;
++    if (runtime_key_match(name,"mqdNorrB+gI#p#J")) return (uintptr_t)rw_write;
++    if (runtime_key_match(name,"XD3mDeybCnk#p#J")) return (uintptr_t)rw_tryread;
++    if (runtime_key_match(name,"bIHoZCTomsI#p#J")) return (uintptr_t)rw_trywrite;
++    if (runtime_key_match(name,"+L98PIbGttk#p#J")) return (uintptr_t)rw_unlock;
++    if (runtime_key_match(name,"iPtZRWICjrM#p#J")) return (uintptr_t)rw_timedread;
++    if (runtime_key_match(name,"adh--6nIqTk#p#J")) return (uintptr_t)rw_timedwrite;
+     return 0;
+ }
+ void runtime_rwlock_report(void) {
+diff --git a/src/runtime_sema.c b/src/runtime_sema.c
+index 345aa89..45fe492 100644
+--- a/src/runtime_sema.c
++++ b/src/runtime_sema.c
+@@ -165,12 +165,12 @@ unsigned runtime_sema_waiters(uint32_t id) {
+     return n;
+ }
+ uintptr_t runtime_sema_resolve(const char *name) {
+-    if (!strcmp(name,"188x57JYp0g#p#J")) return (uintptr_t)sem_create;
+-    if (!strcmp(name,"Zxa0VhQVTsk#p#J")) return (uintptr_t)sem_wait;
+-    if (!strcmp(name,"4czppHBiriw#p#J")) return (uintptr_t)sem_signal;
+-    if (!strcmp(name,"12wOHk8ywb0#p#J")) return (uintptr_t)sem_poll;
+-    if (!strcmp(name,"4DM06U2BNEY#p#J")) return (uintptr_t)sem_cancel;
+-    if (!strcmp(name,"R1Jvn8bSCW8#p#J")) return (uintptr_t)sem_delete;
++    if (runtime_key_match(name,"188x57JYp0g#p#J")) return (uintptr_t)sem_create;
++    if (runtime_key_match(name,"Zxa0VhQVTsk#p#J")) return (uintptr_t)sem_wait;
++    if (runtime_key_match(name,"4czppHBiriw#p#J")) return (uintptr_t)sem_signal;
++    if (runtime_key_match(name,"12wOHk8ywb0#p#J")) return (uintptr_t)sem_poll;
++    if (runtime_key_match(name,"4DM06U2BNEY#p#J")) return (uintptr_t)sem_cancel;
++    if (runtime_key_match(name,"R1Jvn8bSCW8#p#J")) return (uintptr_t)sem_delete;
+     return 0;
+ }
+ void runtime_sema_report(void) {
+diff --git a/src/runtime_services.c b/src/runtime_services.c
+index ba8e56e..92ef12e 100644
+--- a/src/runtime_services.c
++++ b/src/runtime_services.c
+@@ -91,6 +91,9 @@ static ABI int32_t system_status(unsigned char *status) {
+ static ABI int32_t system_event(void *event) { (void)event; return SYSTEM_NO_EVENT; }
+ static ABI int32_t hide_splash(void) { note("SystemService: splash screen hidden"); return 0; }
+ static ABI int32_t launch_browser(void) { note("SystemService: web browser request ignored (offline)"); return 0; }
++/* Music player: the console app that plays background music over a title. There is none here,
++ * and both calls are advisory, so they succeed and do nothing. */
++static ABI int32_t music_player_off(void) { return 0; }
+ 
+ /* ---- NetCtl / Net / Http / Ssl: no network ---- */
+ static int32_t net_errno;
+@@ -396,6 +399,8 @@ static ABI int32_t audio_in_open(void) { return AUDIO_IN_NOT_OPENED; }
+ 
+ 
+ static const RuntimeExport exports[]={
++    {"sceSystemServiceDisableMusicPlayer",music_player_off},
++    {"sceSystemServiceReenableMusicPlayer",music_player_off},
+     {"sceUserServiceInitialize",user_initialize}, {"sceUserServiceTerminate",user_terminate},
+     {"sceUserServiceGetInitialUser",user_initial}, {"sceUserServiceGetLoginUserIdList",user_list},
+     {"sceUserServiceGetUserName",user_name}, {"sceUserServiceGetEvent",user_event},
+@@ -512,7 +517,13 @@ static const RuntimeExport exports[]={
+ };
+ uintptr_t runtime_services_resolve(const char *name) {
+     const uintptr_t online=runtime_net_resolve(name); /* BB_ONLINE=1: the online module first */
+-    return online ? online : RUNTIME_LOOKUP(exports,name);
++    if (online) return online;
++    const uintptr_t symbol=RUNTIME_LOOKUP(exports,name);
++    if (symbol) return symbol;
++    /* In the table above, but import_names.inc has no entry for these libSceSystemService NIDs. */
++    if (runtime_key_match(name,"9kPCz7Or+1Y#")) return (uintptr_t)music_player_off;
++    if (runtime_key_match(name,"x1UB9bwDSOw#")) return (uintptr_t)music_player_off;
++    return 0;
+ }
+ #else
+ uintptr_t runtime_services_resolve(const char *name) { (void)name; return 0; }
+diff --git a/src/runtime_thread.c b/src/runtime_thread.c
+index cedc223..18a7046 100644
+--- a/src/runtime_thread.c
++++ b/src/runtime_thread.c
+@@ -188,6 +188,24 @@ static ABI int32_t attr_set_stack(ThreadAttr **slot,uint64_t size) {
+     if (!a || size<16384) return ERR(22);
+     a->stack=size; return 0;
+ }
++/* scePthreadAttrSetstack takes the stack region the caller mapped. The runtime allocates guest
++ * stacks itself (below the 1 TiB line, which the caller's buffer is not guaranteed to be), so
++ * the size is honoured and the address is not: nothing the guest can observe reports the stack
++ * address back, so a title that maps its own stack sees no difference. */
++static ABI int32_t attr_setstack(ThreadAttr **slot,void *address,uint64_t size) {
++    ThreadAttr *a=find_attr(slot);
++    if (!a || !address || size<16384) return ERR(22);
++    a->stack=size; return 0;
++}
++/* scePthreadCancel: the runtime has no cancellation points, so there is nothing to interrupt.
++ * Reporting EBUSY instead would send a title down an error path it does not expect while
++ * cleaning up, so this succeeds and the thread runs to its own end. */
++static size_t cancel_calls;
++static ABI int32_t thread_cancel(GuestThread *t) {
++    if (!find_thread(t)) return ERR(3);
++    ++cancel_calls;
++    return 0;
++}
+ static ABI int32_t attr_get_stack(ThreadAttr **slot,uint64_t *size) {
+     ThreadAttr *a=find_attr(slot);
+     if (!a || !size) return ERR(22);
+@@ -372,6 +390,7 @@ static ABI int32_t posix_attr_init(ThreadAttr **a) { return posix(attr_init(a));
+ static ABI int32_t posix_attr_destroy(ThreadAttr **a) { return posix(attr_destroy(a)); }
+ static ABI int32_t posix_attr_set_detach(ThreadAttr **a,int s) { return posix(attr_set_detach(a,s)); }
+ static ABI int32_t posix_attr_set_stack(ThreadAttr **a,uint64_t s) { return posix(attr_set_stack(a,s)); }
++static ABI int32_t posix_attr_setstack(ThreadAttr **a,void *p,uint64_t s) { return posix(attr_setstack(a,p,s)); }
+ static ABI int32_t posix_attr_set_param(ThreadAttr **a,const int *p) { return posix(attr_set_param(a,p)); }
+ static ABI int32_t posix_create(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg) { return posix(create(t,a,e,arg,"posix",0)); }
+ static ABI int32_t posix_create_name(GuestThread **t,ThreadAttr **a,GuestEntry e,void *arg,const char *name) { return posix(create(t,a,e,arg,name,0)); }
+@@ -419,14 +438,18 @@ uintptr_t runtime_thread_resolve(const char *name) {
+         {"euKRgm0Vn2M#I#J",posix_attr_set_param}, {"OxhIB8LB-PQ#I#J",posix_create},
+         {"Jmi+9w9u0E4#I#J",posix_create_name}, {"h9CcP3J0oVM#I#J",posix_join},
+         {"FJrT5LuUBAU#I#J",thread_exit},
++        /* CUSA02716: the libkernel spellings this title imports. */
++        {"7Xl257M4VNI#",thread_equal}, {"Bvn74vj6oLo#",posix_attr_setstack},
++        {"qBDmpCyGssE#",thread_cancel},
+     };
+     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)
+-        if (!strcmp(name,table[i].nid)) return (uintptr_t)table[i].fn;
++        if (runtime_key_match(name,table[i].nid)) return (uintptr_t)table[i].fn;
+     return 0;
+ }
+ void runtime_thread_report(void) {
+     pthread_mutex_lock(&lock);
+     printf("Runtime: guest threads created=%zu, exited=%zu, joined=%zu\n",created,exited,joined_count);
++    if (cancel_calls) printf("Runtime: guest thread cancels requested=%zu (no-op)\n",cancel_calls);
+     pthread_mutex_unlock(&lock);
+ }
+ #else
+diff --git a/src/runtime_time.c b/src/runtime_time.c
+index c5470c1..c1a25ff 100644
+--- a/src/runtime_time.c
++++ b/src/runtime_time.c
+@@ -20,7 +20,7 @@ static ABI int guest_gettimeofday(GuestTimeval *value,GuestTimezone *zone) {
+     return 0;
+ }
+ uintptr_t runtime_time_resolve(const char *name) {
+-    if (!strcmp(name,"n88vx3C5nW8#I#J")) return (uintptr_t)guest_gettimeofday;
++    if (runtime_key_match(name,"n88vx3C5nW8#I#J")) return (uintptr_t)guest_gettimeofday;
+     return 0;
+ }
+ #else
+diff --git a/tools/android/build_bionic.sh b/tools/android/build_bionic.sh
+index 9d7bd0b..959285b 100755
+--- a/tools/android/build_bionic.sh
++++ b/tools/android/build_bionic.sh
+@@ -19,12 +19,13 @@ headers=${BB_ARM64_HEADERS:-$PWD/.local-deps/root/usr}
+ toolchain=$ndk/build/cmake/android.toolchain.cmake
+ llvm=$ndk/toolchains/llvm/prebuilt/linux-x86_64
+ J=${BB_JOBS:-22}
+-run() { taskset -c 2-23 nice -n 19 "$@"; }
++run() { nice -n 19 "$@"; }
+ [[ -f $toolchain ]] || { echo "No NDK: $ndk (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
+ [[ -f $prefix/.done-ffmpeg ]] || { echo "No Bionic deps in $prefix (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
+ [[ -f $prefix/.done-openssl && -x $root/host-tools/bin/protoc && -f $prefix/share/cacert.pem ]] \
+     || { echo "No online-module deps (OpenSSL, protobuf, CA bundle) in $prefix (tools/android/build_bionic_deps.sh)" >&2; exit 1; }
+-[[ -d $headers/share/cmake/magic_enum ]] || { echo "No header-only packages in $headers" >&2; exit 1; }
++# The header-only packages may also come from the system (CI): warn rather than stop, CMake then finds them.
++[[ -d $headers/share/cmake/magic_enum ]] || echo "Note: no header-only packages in $headers; using the system's" >&2
+ mkdir -p "$out"
+ ndk_cmake=(-DCMAKE_TOOLCHAIN_FILE="$toolchain" -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$api -DANDROID_STL=c++_shared)
+ # This port's changes to FSR-Vulkan (gpu/patches/fsr-vulkan), applied once, as build.sh does.
+@@ -46,16 +47,19 @@ run ninja -C "$out/cpu" -j "$J" bbcpu > "$out/cpu-build.log" 2>&1 || { grep -E "
+ export PKG_CONFIG_PATH=$prefix/lib/pkgconfig:$prefix/share/pkgconfig
+ export PKG_CONFIG_LIBDIR=$PKG_CONFIG_PATH
+ if [[ ! -f $out/gpu/build.ninja ]]; then
++    # Header-only packages: the PC build's own dependency tree ($headers) when it is there, otherwise
++    # whatever the system provides (CI builds install them elsewhere and let CMake find them).
++    hdr=()
++    [[ -d $headers/share/cmake/magic_enum ]] && hdr+=("-Dmagic_enum_DIR=$headers/share/cmake/magic_enum")
++    [[ -d $headers/share/cmake/tsl-robin-map ]] && hdr+=("-Dtsl-robin-map_DIR=$headers/share/cmake/tsl-robin-map")
++    [[ -d $headers/share/cmake/VulkanMemoryAllocator ]] && hdr+=("-DVulkanMemoryAllocator_DIR=$headers/share/cmake/VulkanMemoryAllocator")
++    [[ -d $headers/lib/cmake/Boost-1.92.0 ]] && hdr+=("-DBoost_DIR=$headers/lib/cmake/Boost-1.92.0" "-Dboost_headers_DIR=$headers/lib/cmake/boost_headers-1.92.0")
++    hdr+=("-DCMAKE_PREFIX_PATH=$prefix;$headers")
+     cmake -S gpu -B "$out/gpu" -G Ninja "${ndk_cmake[@]}" \
+         -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO=off -DBB_LTO=OFF \
+         "-DCMAKE_FIND_ROOT_PATH=$prefix;$headers" -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+-        -DCMAKE_PREFIX_PATH="$prefix;$headers" \
+-        -Dmagic_enum_DIR="$headers/share/cmake/magic_enum" \
+-        -Dtsl-robin-map_DIR="$headers/share/cmake/tsl-robin-map" \
+-        -DVulkanMemoryAllocator_DIR="$headers/share/cmake/VulkanMemoryAllocator" \
+-        -DBoost_DIR="$headers/lib/cmake/Boost-1.92.0" \
+-        -Dboost_headers_DIR="$headers/lib/cmake/boost_headers-1.92.0" >/dev/null
++        "${hdr[@]}" >/dev/null
+ fi
+ # The online module's options (an existing build directory picks them up here): its static dependencies are in
+ # the prefix, and the protoc that generates the shadNet protocol runs on this PC (the same version as the library).
+diff --git a/tools/android/build_bionic_deps.sh b/tools/android/build_bionic_deps.sh
+index e8948f1..6992bb4 100755
+--- a/tools/android/build_bionic_deps.sh
++++ b/tools/android/build_bionic_deps.sh
+@@ -12,7 +12,7 @@ prefix=$root/bionic-prefix src=$root/bionic-src bld=$root/bionic-build
+ [[ -f $ndk/build/cmake/android.toolchain.cmake ]] || { echo "No NDK: $ndk" >&2; exit 1; }
+ mkdir -p "$prefix" "$src" "$bld"
+ J=${BB_JOBS:-22}
+-run() { taskset -c 2-23 nice -n 19 "$@"; }
++run() { nice -n 19 "$@"; }
+ 
+ fetch() { # name url archive-extension
+     local dir=$src/$1
+diff --git a/tools/android/build_bloodframe.sh b/tools/android/build_bloodframe.sh
+index 4fd032a..1b50360 100755
+--- a/tools/android/build_bloodframe.sh
++++ b/tools/android/build_bloodframe.sh
+@@ -39,4 +39,4 @@ cmp -s "$src/android/bb_lsfg.h" tools/android/lsfg/bb_lsfg.h ||
+ if [[ -f $build/CMakeCache.txt ]] && ! grep -qx "CMAKE_HOME_DIRECTORY:INTERNAL=$src" "$build/CMakeCache.txt"; then
+     rm -rf "$build"
+ fi
+-taskset -c 2-23 nice -n 19 "$src/build-android.sh" --ndk "$ndk" --api "$api" --out "$out" --build-dir "$build" --jobs "$J"
++nice -n 19 "$src/build-android.sh" --ndk "$ndk" --api "$api" --out "$out" --build-dir "$build" --jobs "$J"
+diff --git a/tools/android/build_frontend.sh b/tools/android/build_frontend.sh
+index 1807eb7..586190c 100644
+--- a/tools/android/build_frontend.sh
++++ b/tools/android/build_frontend.sh
+@@ -18,16 +18,15 @@ if [[ -n ${BB_RUNTIME_ARCHIVE:-} ]]; then
+     cp "$BB_RUNTIME_ARCHIVE" "$out/assets/runtime.payload"
+     cp "${BB_RUNTIME_ARCHIVE%.tar.gz}.sha256" "$out/assets/runtime.sha256"
+ fi
+-# Use the user's own Bloodborne icon locally; game art is not committed to this repository.
++# Use the user's own game icon locally; game art is not committed to this repository. Without the icon the
++# build keeps the default vector icon (a CI build has no game files; Pillow is then not needed either).
+ python3 - "$out" <<'PY'
+-import os, sys
++import sys
+ from pathlib import Path
+-from PIL import Image
+ out = Path(sys.argv[1])
+ icon = Path('game/CUSA03173/sce_sys/icon0.dds')
+-if os.environ.get('BB_RUNTIME_ARCHIVE') and not icon.exists():
+-    raise SystemExit('Release build needs the user-owned game icon at game/CUSA03173/sce_sys/icon0.dds')
+ if icon.exists():
++    from PIL import Image
+     (out/'res/drawable/icon.xml').unlink(missing_ok=True)
+     Image.open(icon).save(out/'res/drawable/icon.png')
+ PY
+diff --git a/tools/android/build_pkg_tool.sh b/tools/android/build_pkg_tool.sh
+index 2fd7296..74b62e6 100755
+--- a/tools/android/build_pkg_tool.sh
++++ b/tools/android/build_pkg_tool.sh
+@@ -16,7 +16,7 @@ cd -- "$(dirname -- "$0")/../.."
+ root=$PWD
+ which=${1:-all}
+ jobs=${BB_JOBS:-22}
+-run() { taskset -c 2-23 nice -n 19 "$@"; }   # leave two cores free (the PC stays usable)
++run() { nice -n 19 "$@"; }   # leave two cores free (the PC stays usable)
+ src=${BB_PKG_TOOL_SRC:-}
+ if [[ -z $src ]]; then
+     common=$(cd -- "$(git rev-parse --git-common-dir)/.." && pwd)
+diff --git a/tools/android/build_prepare.sh b/tools/android/build_prepare.sh
+index 4a9627e..6a57c0a 100755
+--- a/tools/android/build_prepare.sh
++++ b/tools/android/build_prepare.sh
+@@ -13,7 +13,7 @@ ndk=${BB_NDK:-$root/sdk/ndk/29.0.14206865}
+ api=${BB_ANDROID_API:-30}
+ llvm=$ndk/toolchains/llvm/prebuilt/linux-x86_64
+ J=${BB_JOBS:-22}
+-run() { taskset -c 2-23 nice -n 19 "$@"; }
++run() { nice -n 19 "$@"; }
+ flags=(-std=c++17 -O2 -g -Wall -Wextra -Werror -Wno-unused-parameter)
+ 
+ # build OUT CXX LINK_ARGS...: one object per source file, built in parallel, then linked.
+diff --git a/tools/android/build_turnip_android.sh b/tools/android/build_turnip_android.sh
+index 7a6d457..c5addf3 100755
+--- a/tools/android/build_turnip_android.sh
++++ b/tools/android/build_turnip_android.sh
+@@ -52,7 +52,7 @@ llvm=$ndk/toolchains/llvm/prebuilt/linux-x86_64
+ src=$deps/src/mesa-android-$variant
+ build=$PWD/out/bionic/turnip-$variant-build
+ out=$PWD/out/bionic/turnip-$variant
+-run() { taskset -c 2-23 nice -n 19 "$@"; }
++run() { nice -n 19 "$@"; }
+ 
+ venv=$deps/mesa-venv
+ if [[ ! -x $venv/bin/meson ]]; then
+diff --git a/tools/android/prepare_game.py b/tools/android/prepare_game.py
+index 9875a3d..4e7081c 100644
+--- a/tools/android/prepare_game.py
++++ b/tools/android/prepare_game.py
+@@ -21,12 +21,25 @@ import prepare
+ def signature(game):
+     result = {'path': str(game.resolve())}
+     for name in ('eboot.bin', 'sce_module/libc.prx', 'sce_module/libSceFios2.prx',
+-                 'sce_sys/param.sfo'):
++                 'sce_sys/param.sfo') + tuple(f'sce_module/{m}' for m in modules_for(game)):
+         st = (game / name).stat()
+         result[name] = [st.st_size, st.st_mtime_ns]
+     return result
+ 
+ 
++# The linked modules decide what the runtime can execute natively instead of
++# through the C import table. Bloodborne only ships libc and Fios2; CUSA02716
++# also imports Ngs2 (its software audio mixer) and Audiodec (ATRAC9), and both
++# exist as decrypted system modules, so they are linked as guest code here. A
++# module is only linked when the game folder actually carries it, so this stays
++# the two-module default for every other title.
++CANDIDATE_MODULES = ('libc.prx', 'libSceFios2.prx', 'libSceNgs2.sprx', 'libSceAudiodec.sprx')
++
++
++def modules_for(game):
++    return [m for m in CANDIDATE_MODULES if (game / 'sce_module' / m).is_file()]
++
++
+ def main():
+     if len(sys.argv) != 3:
+         raise SystemExit('usage: prepare_game.py GAME_DIR DATA_DIR')
+@@ -47,7 +60,7 @@ def main():
+     try:
+         print('Game image: preparing selected game files (first launch may take a few minutes)', flush=True)
+         prepare.prepare(game, work)
+-        link_modules.link(game, work)
++        link_modules.link(game, work, modules_for(game))
+         content_profile.prepare(game, work)
+         os.replace(work / 'boot-linked.bin', data / 'boot-linked.bin')
+         os.replace(work / 'content.bin', data / 'content.bin')

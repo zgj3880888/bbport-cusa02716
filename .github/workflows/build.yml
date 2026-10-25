@@ -1,0 +1,120 @@
+name: Build CUSA02716 APK
+
+# 在 GitHub 的 Ubuntu runner 上编译《假面骑士 穿越战争 创生》(CUSA02716) 的 Android 运行时。
+# APK 本身不含游戏数据（这是上游的设计）：libbbaot.so 由玩家在自己 PC 上用 bb-recomp
+# 从自己的游戏文件生成，再放进设备的 bbport/aot/ 目录。
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: '构建阶段（deps 最耗时，可先单独验证）'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - headers
+          - deps
+          - bionic
+          - apk
+  push:
+    branches: [main]
+
+env:
+  # 上游移植工程（本仓库只放补丁和 CI，不放源码）
+  UPSTREAM: ducvd89/Bloodborne-Android
+  UPSTREAM_SHA: f141387d5fb96cc31b1addc15d43b0d96e5dd28e
+  BB_JOBS: 4
+  BB_ANDROID_API: 30
+  DEBIAN_FRONTEND: noninteractive
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: 释放磁盘空间
+        run: |
+          # runner 预装品里用不到的大块头，清掉给构建腾地方
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache \
+                      /usr/local/share/boost /usr/share/swift \
+                      /usr/local/lib/android/sdk/emulator \
+                      /usr/local/lib/android/sdk/system-images || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 检出本仓库（补丁与 CI 脚本）
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      - name: 检出上游移植工程
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ env.UPSTREAM_SHA }}
+          submodules: recursive
+          path: src-tree
+          fetch-depth: 1
+
+      - name: 应用移植补丁
+        run: |
+          cd src-tree
+          git apply --verbose ../ci/patch/cusa02716-runtime.patch
+          echo "--- 补丁后改动统计 ---"
+          git status --short | wc -l
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Android SDK / NDK
+        run: |
+          SDK=/usr/local/lib/android/sdk
+          export ANDROID_HOME=$SDK ANDROID_SDK_ROOT=$SDK
+          SDKM=$(ls $SDK/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          [ -n "$SDKM" ] || { echo "找不到 sdkmanager"; ls -R $SDK/cmdline-tools | head -20; exit 1; }
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "build-tools;35.0.0" "platforms;android-35"
+          # NDK：优先 r29（上游脚本默认），装不上就退到 r28 —— build.sh 会自动回落
+          "$SDKM" --install "ndk;29.0.14206865" || "$SDKM" --install "ndk;28.2.13676358"
+          ls -d $SDK/ndk/* $SDK/build-tools/*
+
+      - name: 安装 host 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build cmake pkg-config ripgrep unzip xz-utils \
+            libboost-dev libssl-dev zlib1g-dev
+          python3 -c "import PIL" 2>/dev/null || pip3 install --break-system-packages Pillow
+
+      - name: 构建
+        run: bash ci/build.sh "${{ inputs.stage || 'all' }}"
+
+      - name: 上传 APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.run_number }}
+          path: src-tree/out/release/*.apk
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 上传构建日志（失败排查用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_number }}
+          path: |
+            src-tree/out/bionic/*.log
+            src-tree/out/gpu-build.log
+            src-tree/.local-deps/android/bionic-build/*.log
+          if-no-files-found: ignore
+          retention-days: 7
