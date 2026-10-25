@@ -1794,6 +1794,39 @@ index afc385a..0ffd0fe 100644
  python3 tools/android/build_release_runtime.py
  BB_RUNTIME_ARCHIVE="$PWD/out/release/runtime.tar.gz" bash tools/android/build_frontend.sh
  cp out/thor/frontend/Bloodborne-Thor.apk "$apk"
+diff --git a/tools/android/build_release_runtime.py b/tools/android/build_release_runtime.py
+index a5f1340..fd23a2f 100644
+--- a/tools/android/build_release_runtime.py
++++ b/tools/android/build_release_runtime.py
+@@ -82,10 +82,14 @@ def stage_runtime(stage):
+     extra = sorted(p.name for p in (BIONIC / 'lib').iterdir() if p.name not in LIBRARIES)
+     if extra:
+         raise SystemExit(f'Unexpected libraries in {BIONIC / "lib"}: {", ".join(extra)} (add them to LIBRARIES if needed)')
+-    if not EBOOT.is_file():
+-        raise SystemExit(f'The game patches are compiled from the 1.09 eboot: {EBOOT} is missing')
+-    subprocess.run([sys.executable, str(TOOLS / 'build_patch_parts.py'), '--out', str(stage / 'patch-parts'),
+-                    '--eboot', str(EBOOT)], check=True)
++    # bbport: the patch parts are compiled from the 1.09 eboot, which only the game's owner has.
++    # A CI build has no game files at all, so package without them instead of refusing to build
++    # (the settings' BBPATCH2 files are then simply absent from the runtime).
++    if EBOOT.is_file():
++        subprocess.run([sys.executable, str(TOOLS / 'build_patch_parts.py'), '--out', str(stage / 'patch-parts'),
++                        '--eboot', str(EBOOT)], check=True)
++    else:
++        print(f'Note: {EBOOT} is missing, packaging without the game patch parts', file=sys.stderr)
+ 
+ 
+ def owned_by_root(member):
+@@ -121,7 +125,8 @@ def main():
+     archive = OUT / 'runtime.tar.gz'
+     with tarfile.open(archive, 'w:gz', compresslevel=6, format=tarfile.PAX_FORMAT) as tar:
+         tar.add(stage / 'bionic', arcname='bbport/bionic', filter=owned_by_root)
+-        tar.add(stage / 'patch-parts', arcname='bbport/patch-parts', filter=owned_by_root)
++        if (stage / 'patch-parts').is_dir():
++            tar.add(stage / 'patch-parts', arcname='bbport/patch-parts', filter=owned_by_root)
+         for source, name, mode in FILES:
+             info = tar.gettarinfo(str(ROOT / source), arcname='bbport/' + name)
+             info.mode = mode
 diff --git a/tools/android/build_turnip_android.sh b/tools/android/build_turnip_android.sh
 index 7a6d457..c5addf3 100755
 --- a/tools/android/build_turnip_android.sh
