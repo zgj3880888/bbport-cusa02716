@@ -3988,3 +3988,39 @@ index 38e4920..88bfff3 100644
  void runtime_file_configure(const char *a,const char *u) { (void)a; (void)u; }
  size_t runtime_panic_text(char *out,size_t size) { if (size) out[0]=0; return 0; }
  #endif
+diff --git a/tools/android/frontend/AndroidManifest.xml b/tools/android/frontend/AndroidManifest.xml
+index 518c7d8..5ba7846 100644
+--- a/tools/android/frontend/AndroidManifest.xml
++++ b/tools/android/frontend/AndroidManifest.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+-    package="com.ducvd89.bloodborne" android:versionCode="36" android:versionName="2.0.1-beta1">
++    package="com.ducvd89.kamenrider" android:versionCode="36" android:versionName="2.0.1-beta1">
+     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="28" />
+     <uses-permission android:name="android.permission.INTERNET" />
+     <uses-permission android:name="android.permission.VIBRATE" />
+@@ -15,7 +15,7 @@
+     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+     <!-- allowAudioPlaybackCapture: screen recorders may record the game's sound (targetSdk 28 apps
+          are not capturable by default on Android 10+). -->
+-    <application android:label="Bloodborne" android:icon="@drawable/icon"
++    <application android:label="假面骑士 创生" android:icon="@drawable/icon"
+         android:theme="@style/GameTheme" android:debuggable="true"
+         android:allowBackup="false" android:extractNativeLibs="true" android:isGame="true" android:appCategory="game"
+         android:requestLegacyExternalStorage="true"
+@@ -35,12 +35,12 @@
+         <!-- Hunter's Atlas' map on a second display that refuses a Presentation: its own task on that display, never in
+              recents, not focusable (AtlasActivity). No orientation lock: it follows the display. -->
+         <activity android:name="ro.cobrabm.fexdroid.AtlasActivity" android:exported="false"
+-            android:theme="@style/AtlasTheme" android:taskAffinity="com.ducvd89.bloodborne.atlas"
++            android:theme="@style/AtlasTheme" android:taskAffinity="com.ducvd89.kamenrider.atlas"
+             android:launchMode="singleInstance" android:excludeFromRecents="true" android:resizeableActivity="true"
+             android:noHistory="false" android:label="Hunter's Atlas"
+             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation|uiMode" />
+         <!-- Serves the problem report's zip (files/reports) to the share sheet; see ReportProvider. -->
+-        <provider android:name="ro.cobrabm.fexdroid.ReportProvider" android:authorities="com.ducvd89.bloodborne.reports"
++        <provider android:name="ro.cobrabm.fexdroid.ReportProvider" android:authorities="com.ducvd89.kamenrider.reports"
+             android:exported="false" android:grantUriPermissions="true" />
+     </application>
+ </manifest>
