@@ -2292,10 +2292,10 @@ diff --git a/tools/android/frontend/src/ro/cobrabm/fexdroid/NativeCpu.java b/too
          if (gameVersion != null && info.gameVersion != null && !gameVersion.equals(info.gameVersion))
 diff --git a/src/runtime_ngs2.c b/src/runtime_ngs2.c
 new file mode 100644
-index 0000000..a60167f
+index 0000000..2d8d516
 --- /dev/null
 +++ b/src/runtime_ngs2.c
-@@ -0,0 +1,664 @@
+@@ -0,0 +1,690 @@
 +/* libSceNgs2: the audio render graph. CUSA02716 imports exactly twelve of its functions, and they
 + * are a closed set: create a system and a rack from memory the game allocates itself, hand out the
 + * rack's voice handles, set the sample rate and the grain size, control the voices, read their
@@ -2588,6 +2588,20 @@ index 0000000..a60167f
 +    memset(buffer, 0, sizeof(*buffer));
 +}
 +
++/* A null option means "the library defaults", not an error. The game creates its own system with
++ * a null option (the WaveCue setup at guest 0x2d89ee is `xor edi,edi` right before the call), and
++ * on hardware that yields a system in the default format. Refusing it made every WaveCue creation
++ * fail at its first step, which left the cue table at guest 0xb09758 full of null slots; the next
++ * acquire (0x2d9410) then dereferenced slot + 0xe0 and died at address 0xe8. */
++static const Ngs2SystemOption *system_option_or_default(const Ngs2SystemOption *option) {
++    static const Ngs2SystemOption defaults = {sizeof(Ngs2SystemOption)};
++    return option ? option : &defaults;
++}
++static const Ngs2RackOption *rack_option_or_default(const Ngs2RackOption *option) {
++    static const Ngs2RackOption defaults = {sizeof(Ngs2RackOption)};
++    return option ? option : &defaults;
++}
++
 +static ABI int32_t ngs2_system_create_with_allocator(const Ngs2SystemOption *option,
 +                                                     const Ngs2Allocator *allocator, uintptr_t *out_handle) {
 +    Ngs2BufferInfo buffer;
@@ -2595,10 +2609,14 @@ index 0000000..a60167f
 +    int32_t error;
 +    int owned = 0, slot;
 +    if (!out_handle) return ERR_INVALID_OUT_ADDRESS;
-+    if (!option) return ERR_INVALID_OPTION_ADDRESS;
++    option = system_option_or_default(option);
 +    if (option->size < 32) return ERR_INVALID_OPTION_SIZE;
 +    error = acquire_buffer(system_buffer_size(option), allocator, &buffer, &release, &owned);
-+    if (error) return error;
++    if (error) {
++        printf("Runtime: ngs2 system create failed: buffer %zu bytes, allocator %s, error 0x%08x\n",
++               system_buffer_size(option), allocator ? "game" : "none", (unsigned)error);
++        return error;
++    }
 +    pthread_mutex_lock(&table_lock);
 +    slot = first_free(&systems[0].used, MAX_SYSTEMS, sizeof(Ngs2System));
 +    if (slot < 0) {
@@ -2735,14 +2753,22 @@ index 0000000..a60167f
 +    int32_t error;
 +    int owned = 0, slot;
 +    if (!out_handle) return ERR_INVALID_OUT_ADDRESS;
-+    if (!option) return ERR_INVALID_OPTION_ADDRESS;
++    option = rack_option_or_default(option);
 +    if (option->size < 40) return ERR_INVALID_OPTION_SIZE;
 +    pthread_mutex_lock(&table_lock);
 +    Ngs2System *system = system_of(system_handle);
 +    pthread_mutex_unlock(&table_lock);
-+    if (!system) return ERR_INVALID_SYSTEM_HANDLE;
++    if (!system) {
++        printf("Runtime: ngs2 rack create failed: system handle 0x%llx is not open\n",
++               (unsigned long long)system_handle);
++        return ERR_INVALID_SYSTEM_HANDLE;
++    }
 +    error = acquire_buffer(rack_buffer_size(option), allocator, &buffer, &release, &owned);
-+    if (error) return error;
++    if (error) {
++        printf("Runtime: ngs2 rack create failed: rackId=%u buffer %zu bytes, error 0x%08x\n",
++               rack_id, rack_buffer_size(option), (unsigned)error);
++        return error;
++    }
 +    pthread_mutex_lock(&table_lock);
 +    slot = first_free(&racks[0].used, MAX_RACKS, sizeof(Ngs2Rack));
 +    system = system_of(system_handle);
